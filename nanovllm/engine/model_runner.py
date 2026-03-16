@@ -26,7 +26,7 @@ class ModelRunner:
         self.event = event
 
         dist.init_process_group(
-            "nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank
+            "nccl", "tcp://localhost:2337", world_size=self.world_size, rank=rank
         )
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()

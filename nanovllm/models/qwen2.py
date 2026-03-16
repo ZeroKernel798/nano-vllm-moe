@@ -120,7 +120,8 @@ class Qwen2DecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
             rope_theta=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            # rope_scaling=getattr(config, "rope_scaling", None),
+            rope_scaling=None,
         )
         self.mlp = Qwen2MLP(
             hidden_size=config.hidden_size,
