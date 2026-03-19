@@ -42,7 +42,7 @@ def main(args):
 if __name__ == "__main__":
     argparse = argparse.ArgumentParser(description="nano vllm")
     argparse.add_argument(
-        "--model-path", type=str, default="/home/zerokernel_ac/huggingface/qwen/Qwen1.5-MoE-A2.7B-Chat"
+        "--model-path", type=str, default="/root/autodl-tmp/models/qwen/Qwen1.5-MoE-A2.7B-Chat"
     )
     argparse.add_argument("--tensor-parallel-size", "--tp", type=int, default=1)
     argparse.add_argument("--enforce-eager", type=bool, default=True)
