@@ -29,10 +29,33 @@ class ModelRunner:
             "nccl", "tcp://localhost:2335", world_size=self.world_size, rank=rank
         )
         torch.cuda.set_device(rank)
+        
+        # 设置ep、tp参数
+        tp_size = 1
+        ep_size = 2
+        self.tp_group = None
+        self.ep_group = None
+        # 创建 TP 组
+        for i in range(self.world_size // tp_size):
+            ranks = list(range(i * tp_size, (i + 1) * tp_size))
+            group = dist.new_group(ranks)
+            if rank in ranks: 
+                self.tp_group = group
+        # 创建 EP 组
+        for i in range(tp_size):
+            ranks = list(range(i, self.world_size, tp_size))
+            group = dist.new_group(ranks)
+            if rank in ranks: 
+                self.ep_group = group
+
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = model_dict[hf_config.model_type](hf_config)
+        self.model = model_dict[hf_config.model_type](
+            hf_config, 
+            tp_group=self.tp_group, 
+            ep_group=self.ep_group
+        )
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -113,7 +136,10 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        
+        tp_size = dist.get_world_size(self.tp_group) if hasattr(self, "tp_group") and self.tp_group is not None else 1
+        num_kv_heads = hf_config.num_key_value_heads // tp_size
+        
         assert hf_config.hidden_size % hf_config.num_attention_heads == 0
         head_dim = (
             hf_config.head_dim

@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from typing import Optional
 
 
 def divide(numerator, denominator):
@@ -10,33 +11,42 @@ def divide(numerator, denominator):
 
 
 class LinearBase(nn.Module):
-
     def __init__(
         self,
         input_size: int,
         output_size: int,
         tp_dim: int | None = None,
+        tp_group: Optional[dist.ProcessGroup] = None, 
+        **kwargs, 
     ):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
         self.tp_dim = tp_dim
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_group = tp_group
+        
+        # 所有的 rank 和 size 都必须从传入的 tp_group 获取
+        if tp_group is not None:
+            self.tp_size = dist.get_world_size(tp_group)
+            self.tp_rank = dist.get_rank(tp_group)
+        else:
+            self.tp_size = dist.get_world_size() if dist.is_initialized() else 1
+            self.tp_rank = dist.get_rank() if dist.is_initialized() else 0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
 
 class ReplicatedLinear(LinearBase):
-
     def __init__(
         self,
         input_size: int,
         output_size: int,
         bias: bool = False,
+        tp_group: Optional[dist.ProcessGroup] = None,
+        **kwargs,
     ):
-        super().__init__(input_size, output_size)
+        super().__init__(input_size, output_size, tp_group=tp_group, **kwargs)
         self.weight = nn.Parameter(torch.empty(self.output_size, self.input_size))
         self.weight.weight_loader = self.weight_loader
         if bias:
@@ -53,14 +63,15 @@ class ReplicatedLinear(LinearBase):
 
 
 class ColumnParallelLinear(LinearBase):
-
     def __init__(
         self,
         input_size: int,
         output_size: int,
         bias: bool = False,
+        tp_group: Optional[dist.ProcessGroup] = None,
+        **kwargs,
     ):
-        super().__init__(input_size, output_size, 0)
+        super().__init__(input_size, output_size, 0, tp_group=tp_group, **kwargs)
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
 
@@ -86,15 +97,16 @@ class ColumnParallelLinear(LinearBase):
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
-
     def __init__(
         self,
         input_size: int,
         output_sizes: list[int],
         bias: bool = False,
+        tp_group: Optional[dist.ProcessGroup] = None,
+        **kwargs,
     ):
         self.output_sizes = output_sizes
-        super().__init__(input_size, sum(output_sizes), bias=bias)
+        super().__init__(input_size, sum(output_sizes), bias=bias, tp_group=tp_group, **kwargs)
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int
@@ -108,7 +120,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
 
 class QKVParallelLinear(ColumnParallelLinear):
-
     def __init__(
         self,
         hidden_size: int,
@@ -116,18 +127,24 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_heads: int,
         total_num_kv_heads: int | None = None,
         bias: bool = False,
+        tp_group: Optional[dist.ProcessGroup] = None,
+        **kwargs,
     ):
         self.head_size = head_size
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads or total_num_heads
-        tp_size = dist.get_world_size()
+        
+        # 从组里取
+        tp_size = dist.get_world_size(tp_group) if tp_group is not None else (dist.get_world_size() if dist.is_initialized() else 1)
+        
         self.num_heads = divide(self.total_num_heads, tp_size)
         self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
         input_size = hidden_size
         output_size = (
             self.total_num_heads + 2 * self.total_num_kv_heads
         ) * self.head_size
-        super().__init__(input_size, output_size, bias)
+        
+        super().__init__(input_size, output_size, bias=bias, tp_group=tp_group, **kwargs)
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str
@@ -151,15 +168,16 @@ class QKVParallelLinear(ColumnParallelLinear):
 
 
 class RowParallelLinear(LinearBase):
-
     def __init__(
         self,
         input_size: int,
         output_size: int,
         bias: bool = False,
         reduce_results=True,
+        tp_group: Optional[dist.ProcessGroup] = None,
+        **kwargs,
     ):
-        super().__init__(input_size, output_size, 1)
+        super().__init__(input_size, output_size, 1, tp_group=tp_group, **kwargs)
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.reduce_results = reduce_results
@@ -184,5 +202,5 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1 and self.reduce_results:
-            dist.all_reduce(y)
+            dist.all_reduce(y, group=self.tp_group)
         return y
