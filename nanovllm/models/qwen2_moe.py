@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+import triton
 from transformers import Qwen2MoeConfig 
 
 from nanovllm.layers.activation import SiluAndMul
@@ -14,6 +15,10 @@ from nanovllm.layers.linear import (
     RowParallelLinear,
 )
 from nanovllm.layers.rotary_embedding import get_rope
+
+from nanovllm.kernels.group_gemm import moe_gemm_kernel
+from nanovllm.kernels.group_gemm import fused_moe_w13_kernel
+from nanovllm.utils.moe import moe_align_helper
 
 class Qwen2MoeAttention(nn.Module):
     def __init__(
@@ -172,7 +177,206 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             sparse_hidden_states.index_add_(0, top_x, expert_out * routing_weights[top_x, idx, None])
 
         return (shared_output + sparse_hidden_states).view(orig_shape)
-    
+
+
+# class Qwen2MoeSparseMoeBlock(nn.Module):
+#     def __init__(self, config) -> None:
+#         super().__init__()
+#         self.hidden_size = config.hidden_size
+#         self.num_experts = config.num_experts
+#         self.top_k = config.num_experts_per_tok
+#         self.moe_intermediate_size = config.moe_intermediate_size
+
+#         self.w13_stacked = nn.Parameter(torch.empty(
+#             self.num_experts, 2 * self.moe_intermediate_size, self.hidden_size
+#         ))
+#         self.w2_stacked = nn.Parameter(torch.empty(
+#             self.num_experts, self.hidden_size, self.moe_intermediate_size
+#         ))
+#         self.w13_stacked.weight_loader = self.load_moe_weight
+#         self.w2_stacked.weight_loader = self.load_moe_weight
+
+#         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+#         self.shared_expert_gate = nn.Linear(self.hidden_size, 1, bias=False)
+
+#         from nanovllm.models.qwen2_moe import Qwen2MoeMLP
+#         self.shared_expert = Qwen2MoeMLP(
+#             hidden_size=config.hidden_size,
+#             intermediate_size=config.shared_expert_intermediate_size,
+#             hidden_act=config.hidden_act,
+#         )
+
+#     def load_moe_weight(self, param, loaded_weight, expert_id, shard_id=None):
+#         with torch.no_grad():
+#             if shard_id is not None:
+#                 offset = shard_id * self.moe_intermediate_size
+#                 param.data[expert_id].narrow(0, offset, self.moe_intermediate_size).copy_(loaded_weight)
+#             else:
+#                 param.data[expert_id].copy_(loaded_weight)
+
+#     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+#         orig_shape = hidden_states.shape
+#         x = hidden_states.view(-1, self.hidden_size).contiguous()
+#         model_dtype = x.dtype
+
+#         # 共享专家
+#         shared_output = self.shared_expert(x)
+#         shared_weight = torch.sigmoid(self.shared_expert_gate(x))
+#         shared_output = shared_output * shared_weight
+
+#         # 路由
+#         router_logits = self.gate(x)
+#         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+#         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+
+#         # 对齐
+#         BLOCK_SIZE_M = 32
+#         # 接收新增的准确位置映射
+#         aligned_token_ids, expert_ids, num_blocks, padded_positions, original_token_ids, sorted_indices = moe_align_helper(
+#             selected_experts, BLOCK_SIZE_M, self.num_experts
+#         )
+
+#         # W13 计算
+#         inter_size = self.moe_intermediate_size
+#         total_tasks = aligned_token_ids.shape[0]
+#         gate_up_out = torch.empty((total_tasks, inter_size * 2), device=x.device, dtype=model_dtype).contiguous()
+
+#         grid_w13 = lambda META: (num_blocks * triton.cdiv(inter_size * 2, META['BLOCK_SIZE_N']),)
+#         moe_gemm_kernel[grid_w13](
+#             x, self.w13_stacked, gate_up_out,
+#             aligned_token_ids, expert_ids,
+#             inter_size * 2, self.hidden_size,
+#             x.stride(0), x.stride(1),
+#             self.w13_stacked.stride(0), self.w13_stacked.stride(2), self.w13_stacked.stride(1),
+#             gate_up_out.stride(0), gate_up_out.stride(1),
+#             BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32,
+#         )
+
+#         # 激活
+#         gate, up = gate_up_out.chunk(2, dim=-1)
+#         activated_out = (F.silu(gate.to(torch.float32)) * up.to(torch.float32)).to(model_dtype).contiguous()
+
+#         # W2 计算
+#         final_flat_out = torch.empty((total_tasks, self.hidden_size), device=x.device, dtype=model_dtype).contiguous()
+#         sequential_ids = torch.arange(total_tasks, device=x.device, dtype=torch.int32)
+
+#         grid_w2 = lambda META: (num_blocks * triton.cdiv(self.hidden_size, META['BLOCK_SIZE_N']),)
+#         moe_gemm_kernel[grid_w2](
+#             activated_out, self.w2_stacked, final_flat_out,
+#             sequential_ids, expert_ids,
+#             self.hidden_size, inter_size,
+#             activated_out.stride(0), activated_out.stride(1),
+#             self.w2_stacked.stride(0), self.w2_stacked.stride(2), self.w2_stacked.stride(1),
+#             final_flat_out.stride(0), final_flat_out.stride(1),
+#             BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32,
+#         )
+
+#         # 聚合还原 
+#         valid_outputs = final_flat_out[padded_positions]
+        
+#         flat_weights = routing_weights.to(model_dtype).reshape(-1)
+#         sorted_flat_weights = flat_weights[sorted_indices]
+#         weighted_out = valid_outputs * sorted_flat_weights.view(-1, 1)
+        
+#         combined_sparse = torch.zeros_like(x)
+#         combined_sparse.index_add_(0, original_token_ids.long(), weighted_out)
+
+#         return (shared_output + combined_sparse).view(orig_shape)
+
+
+# class Qwen2MoeSparseMoeBlock(nn.Module):
+#     def __init__(self, config) -> None:
+#         super().__init__()
+#         self.hidden_size = config.hidden_size
+#         self.num_experts = config.num_experts
+#         # self.top_k = config.num_experts_per_tok
+#         self.top_k = 1
+#         self.moe_intermediate_size = config.moe_intermediate_size
+
+#         self.w13_stacked = nn.Parameter(torch.empty(self.num_experts, 2 * self.moe_intermediate_size, self.hidden_size))
+#         self.w2_stacked = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, self.moe_intermediate_size))
+#         self.w13_stacked.weight_loader = self.load_moe_weight
+#         self.w2_stacked.weight_loader = self.load_moe_weight
+
+#         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+#         self.shared_expert_gate = nn.Linear(self.hidden_size, 1, bias=False)
+
+#         from nanovllm.models.qwen2_moe import Qwen2MoeMLP
+#         self.shared_expert = Qwen2MoeMLP(
+#             hidden_size=config.hidden_size,
+#             intermediate_size=config.shared_expert_intermediate_size,
+#             hidden_act=config.hidden_act,
+#         )
+
+#     def load_moe_weight(self, param, loaded_weight, expert_id, shard_id=None):
+#         with torch.no_grad():
+#             if shard_id is not None:
+#                 offset = shard_id * self.moe_intermediate_size
+#                 param.data[expert_id].narrow(0, offset, self.moe_intermediate_size).copy_(loaded_weight)
+#             else:
+#                 param.data[expert_id].copy_(loaded_weight)
+
+#     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+#         orig_shape = hidden_states.shape
+#         x = hidden_states.view(-1, self.hidden_size).contiguous()
+#         model_dtype = x.dtype
+
+#         # 共享专家
+#         shared_output = self.shared_expert(x)
+#         shared_weight = torch.sigmoid(self.shared_expert_gate(x))
+#         shared_output = shared_output * shared_weight
+
+#         # 路由
+#         router_logits = self.gate(x)
+#         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+#         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+
+#         BLOCK_SIZE_M = 32
+#         aligned_token_ids, expert_ids, num_blocks, padded_positions, original_token_ids, sorted_indices = moe_align_helper(
+#             selected_experts, BLOCK_SIZE_M, self.num_experts
+#         )
+
+#         # 融合后的 W13 计算
+#         inter_size = self.moe_intermediate_size
+#         total_tasks = aligned_token_ids.shape[0]
+#         activated_out = torch.zeros((total_tasks, inter_size), device=x.device, dtype=model_dtype)
+
+#         grid_w13 = lambda META: (num_blocks * triton.cdiv(inter_size, META['BLOCK_SIZE_N']),)
+#         fused_moe_w13_kernel[grid_w13](
+#             x, self.w13_stacked, activated_out,
+#             aligned_token_ids, expert_ids,
+#             inter_size * 2, self.hidden_size, 
+#             x.stride(0), x.stride(1),
+#             self.w13_stacked.stride(0), self.w13_stacked.stride(2), self.w13_stacked.stride(1),
+#             activated_out.stride(0), activated_out.stride(1),
+#             BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32,
+#         )
+
+#         # W2 计算
+#         final_flat_out = torch.zeros((total_tasks, self.hidden_size), device=x.device, dtype=model_dtype)
+#         sequential_ids = torch.arange(total_tasks, device=x.device, dtype=torch.int32)
+
+#         grid_w2 = lambda META: (num_blocks * triton.cdiv(self.hidden_size, META['BLOCK_SIZE_N']),)
+#         moe_gemm_kernel[grid_w2](
+#             activated_out, self.w2_stacked, final_flat_out,
+#             sequential_ids, expert_ids,
+#             self.hidden_size, inter_size,
+#             activated_out.stride(0), activated_out.stride(1),
+#             self.w2_stacked.stride(0), self.w2_stacked.stride(2), self.w2_stacked.stride(1),
+#             final_flat_out.stride(0), final_flat_out.stride(1),
+#             BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32,
+#         )
+
+#         # 聚合
+#         valid_outputs = final_flat_out[padded_positions]
+#         flat_weights = routing_weights.to(model_dtype).reshape(-1)
+#         weighted_out = valid_outputs * flat_weights[sorted_indices].view(-1, 1)
+        
+#         combined_sparse = torch.zeros_like(x)
+#         combined_sparse.index_add_(0, original_token_ids.long(), weighted_out)
+
+#         return (shared_output + combined_sparse).view(orig_shape)
+ 
 
 class Qwen2MoeDecoderLayer(nn.Module):
     def __init__(

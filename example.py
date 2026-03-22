@@ -21,6 +21,8 @@ def main(args):
     prompts = [
         "introduce yourself",
         "list all prime numbers within 100",
+        "你好 请问你是谁",
+        "What is 123 + 456",
     ]
     prompts = [
         tokenizer.apply_chat_template(
