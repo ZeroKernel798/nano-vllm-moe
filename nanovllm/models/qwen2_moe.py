@@ -114,72 +114,72 @@
 #         x = self.down_proj(x)
 #         return x
 
-# # class Qwen2MoeSparseMoeBlock(nn.Module):
-# #     def __init__(
-# #         self,
-# #         config: Qwen2MoeConfig
-# #     ) -> None:
-# #         super().__init__()
-# #         self.hidden_size = config.hidden_size
-# #         self.intermediate_size = config.intermediate_size
-# #         self.hidden_act = config.hidden_act
+# class Qwen2MoeSparseMoeBlock(nn.Module):
+#     def __init__(
+#         self,
+#         config: Qwen2MoeConfig
+#     ) -> None:
+#         super().__init__()
+#         self.hidden_size = config.hidden_size
+#         self.intermediate_size = config.intermediate_size
+#         self.hidden_act = config.hidden_act
 
-# #         self.num_experts = config.num_experts
-# #         self.top_k = config.num_experts_per_tok
+#         self.num_experts = config.num_experts
+#         self.top_k = config.num_experts_per_tok
 
-# #         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+#         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
 
-# #         self.shared_expert_gate = nn.Linear(self.hidden_size, 1, bias=False)
+#         self.shared_expert_gate = nn.Linear(self.hidden_size, 1, bias=False)
 
-# #         self.shared_expert = Qwen2MoeMLP(
-# #             hidden_size=config.hidden_size,
-# #             intermediate_size=config.shared_expert_intermediate_size,
-# #             hidden_act=config.hidden_act,
-# #         )
+#         self.shared_expert = Qwen2MoeMLP(
+#             hidden_size=config.hidden_size,
+#             intermediate_size=config.shared_expert_intermediate_size,
+#             hidden_act=config.hidden_act,
+#         )
 
-# #         self.experts = nn.ModuleList(
-# #         [
-# #             Qwen2MoeMLP(
-# #                 hidden_size=config.hidden_size,
-# #                 intermediate_size=config.moe_intermediate_size,
-# #                 hidden_act=config.hidden_act,
-# #             ) for _ in range(self.num_experts)
-# #         ]
-# #     )
+#         self.experts = nn.ModuleList(
+#         [
+#             Qwen2MoeMLP(
+#                 hidden_size=config.hidden_size,
+#                 intermediate_size=config.moe_intermediate_size,
+#                 hidden_act=config.hidden_act,
+#             ) for _ in range(self.num_experts)
+#         ]
+#     )
 
-# #     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-# #         orig_shape = hidden_states.shape
-# #         hidden_states = hidden_states.view(-1, self.hidden_size)
+#     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+#         orig_shape = hidden_states.shape
+#         hidden_states = hidden_states.view(-1, self.hidden_size)
 
-# #         # 计算路由的logits
-# #         router_logits = self.gate(hidden_states)
-# #         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-# #         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-# #         # routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-# #         routing_weights = routing_weights.to(hidden_states.dtype)
+#         # 计算路由的logits
+#         router_logits = self.gate(hidden_states)
+#         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+#         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+#         # routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+#         routing_weights = routing_weights.to(hidden_states.dtype)
 
-# #         # 共享专家
-# #         shared_output = self.shared_expert(hidden_states)
-# #         shared_weight = torch.sigmoid(self.shared_expert_gate(hidden_states))
-# #         shared_output = shared_output * shared_weight
+#         # 共享专家
+#         shared_output = self.shared_expert(hidden_states)
+#         shared_weight = torch.sigmoid(self.shared_expert_gate(hidden_states))
+#         shared_output = shared_output * shared_weight
 
-# #         # 稀疏专家
-# #         sparse_hidden_states = torch.zeros(
-# #             hidden_states.shape,
-# #             dtype=hidden_states.dtype,
-# #             device=hidden_states.device,
-# #         )
-# #         expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+#         # 稀疏专家
+#         sparse_hidden_states = torch.zeros(
+#             hidden_states.shape,
+#             dtype=hidden_states.dtype,
+#             device=hidden_states.device,
+#         )
+#         expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
-# #         for i in range(self.num_experts):
-# #             idx, top_x = torch.where(expert_mask[i])
-# #             if top_x.shape[0] == 0:
-# #                 continue
+#         for i in range(self.num_experts):
+#             idx, top_x = torch.where(expert_mask[i])
+#             if top_x.shape[0] == 0:
+#                 continue
             
-# #             expert_out = self.experts[i](hidden_states[top_x])
-# #             sparse_hidden_states.index_add_(0, top_x, expert_out * routing_weights[top_x, idx, None])
+#             expert_out = self.experts[i](hidden_states[top_x])
+#             sparse_hidden_states.index_add_(0, top_x, expert_out * routing_weights[top_x, idx, None])
 
-# #         return (shared_output + sparse_hidden_states).view(orig_shape)
+#         return (shared_output + sparse_hidden_states).view(orig_shape)
 
 # # 可切换overlap以及串行逻辑
 # # class Qwen2MoeSparseMoeBlock(nn.Module):
@@ -681,7 +681,6 @@ class Qwen2MoeAttention(nn.Module):
         output = self.o_proj(attn_output)
         return output
     
-
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -708,6 +707,74 @@ class Qwen2MoeMLP(nn.Module):
         x = self.down_proj(x)
         return x
 
+
+class Qwen2MoeEagerSparseMoeBlock(nn.Module):
+    def __init__(
+        self,
+        config: Qwen2MoeConfig,
+        tp_group: Optional[dist.ProcessGroup] = None,
+        ep_group: Optional[dist.ProcessGroup] = None, # 传进来但不用，保持接口一致
+    ) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.hidden_act = config.hidden_act
+
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+
+        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+        self.shared_expert_gate = nn.Linear(self.hidden_size, 1, bias=False)
+
+        # 同样需要传入 tp_group 保证内部线性层并行正确
+        self.shared_expert = Qwen2MoeMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.shared_expert_intermediate_size,
+            hidden_act=config.hidden_act,
+            tp_group=tp_group 
+        )
+
+        self.experts = nn.ModuleList(
+            [
+                Qwen2MoeMLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.moe_intermediate_size,
+                    hidden_act=config.hidden_act,
+                    tp_group=tp_group
+                ) for _ in range(self.num_experts)
+            ]
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, self.hidden_size)
+
+        router_logits = self.gate(hidden_states)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        shared_output = self.shared_expert(hidden_states)
+        shared_weight = torch.sigmoid(self.shared_expert_gate(hidden_states))
+        shared_output = shared_output * shared_weight
+
+        sparse_hidden_states = torch.zeros(
+            hidden_states.shape,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        for i in range(self.num_experts):
+            idx, top_x = torch.where(expert_mask[i])
+            if top_x.shape[0] == 0:
+                continue
+            
+            expert_out = self.experts[i](hidden_states[top_x])
+            sparse_hidden_states.index_add_(0, top_x, expert_out * routing_weights[top_x, idx, None])
+
+        return (shared_output + sparse_hidden_states).view(orig_shape)
+    
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
@@ -886,6 +953,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         layer_idx: int,
         tp_group: Optional[dist.ProcessGroup] = None,
         ep_group: Optional[dist.ProcessGroup] = None,
+        group_gemm_enable : bool = False
     ) -> None:
         super().__init__()
         self.self_attn = Qwen2MoeAttention(
@@ -901,7 +969,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
         if (layer_idx not in mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
-            self.mlp = Qwen2MoeSparseMoeBlock(config=config, tp_group=tp_group, ep_group=ep_group)
+            if group_gemm_enable:
+                self.mlp = Qwen2MoeSparseMoeBlock(config=config, tp_group=tp_group, ep_group=ep_group)
+            else:
+                self.mlp = Qwen2MoeEagerSparseMoeBlock(config=config, tp_group=tp_group, ep_group=ep_group)
         else:
             self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,

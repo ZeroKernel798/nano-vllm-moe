@@ -83,8 +83,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model-path", type=str, default="/home/zerokernel_ac/huggingface/qwen/Qwen1.5-MoE-A2.7B-Chat"
     )
-    parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--ep-size", type=int, default=2)
+    parser.add_argument("--tp-size", type=int, default=2)
+    parser.add_argument("--ep-size", type=int, default=1)
     parser.add_argument("--enforce-eager", type=bool, default=True)
     
     # 增加压测参数配置

@@ -47,7 +47,7 @@ if __name__ == "__main__":
     argparse.add_argument(
         "--model-path", type=str, default="/home/zerokernel_ac/huggingface/qwen/Qwen1.5-MoE-A2.7B-Chat"
     )
-    argparse.add_argument("--tp-size", type=int, default=2)
+    argparse.add_argument("--tp-size", type=int, default=1)
     argparse.add_argument("--ep-size", type=int, default=1)
     argparse.add_argument("--enforce-eager", type=bool, default=True)
     argparse.add_argument("--temperature", type=float, default=0.6)
