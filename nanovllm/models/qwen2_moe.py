@@ -179,27 +179,36 @@ class Qwen2MoeMLP(nn.Module):
 
 #         return (shared_output + sparse_hidden_states).view(orig_shape)
 
+# 可切换overlap以及串行逻辑
 class Qwen2MoeSparseMoeBlock(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config, use_overlap: bool = True) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.moe_intermediate_size = config.moe_intermediate_size
+        
+        # 方案切换开关
+        self.use_overlap = use_overlap
 
         self.w13_stacked = nn.Parameter(torch.empty(self.num_experts, 2 * self.moe_intermediate_size, self.hidden_size))
         self.w2_stacked = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, self.moe_intermediate_size))
         self.w13_stacked.weight_loader = self.load_moe_weight
         self.w2_stacked.weight_loader = self.load_moe_weight
-
+        
         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
-
+        
         self.shared_expert_gate = nn.Linear(self.hidden_size, 1, bias=False)
         self.shared_expert = Qwen2MoeMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.shared_expert_intermediate_size,
             hidden_act=config.hidden_act,
         )
+
+        if self.use_overlap:
+            self.shared_expert_stream = torch.cuda.Stream()
+        else:
+            self.shared_expert_stream = None
 
     def load_moe_weight(self, param, loaded_weight, expert_id, shard_id=None):
         with torch.no_grad():
@@ -209,16 +218,25 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             else:
                 param.data[expert_id].copy_(loaded_weight)
 
+    def _compute_shared_expert(self, x):
+        out = self.shared_expert(x)
+        out *= torch.sigmoid(self.shared_expert_gate(x))
+        return out
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         x = hidden_states.view(-1, self.hidden_size).contiguous()
-        model_dtype = x.dtype
         M = x.shape[0]
+        model_dtype = x.dtype
 
-        shared_output = self.shared_expert(x)
-        shared_weight = torch.sigmoid(self.shared_expert_gate(x))
-        shared_output = shared_output * shared_weight
+        if self.use_overlap:
+            # overlap
+            with torch.cuda.stream(self.shared_expert_stream):
+                shared_out = self._compute_shared_expert(x)
+        else:
+            shared_out = self._compute_shared_expert(x)
 
+       
         router_logits = self.gate(x)
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
@@ -226,59 +244,45 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         BLOCK_SIZE_M = 32
         GROUP_SIZE_M = 8 
-        
-        # 这里的 num_blocks 是对齐后的 Block 总数
         sorted_token_ids, sorted_weight_idx, expert_ids, num_blocks = moe_align_block_size(
             selected_experts, self.num_experts, BLOCK_SIZE_M
         )
         
-        # 对齐后的总任务数 (包含 Padding)
-        EM = num_blocks * BLOCK_SIZE_M 
-
         inter_size = self.moe_intermediate_size
         num_total_tasks = M * self.top_k
         activated_out = torch.zeros((num_total_tasks, inter_size), device=x.device, dtype=model_dtype)
 
-        # 这里的 Grid 计算逻辑要考虑到 N 维的分块
         grid_w13 = lambda META: (num_blocks * triton.cdiv(inter_size, META['BLOCK_SIZE_N']),)
-        
         fused_moe_w13_kernel[grid_w13](
             x, self.w13_stacked, activated_out,
             sorted_token_ids, sorted_weight_idx, expert_ids,
-            num_blocks,      # <--- 对应 Kernel 的 num_blocks
-            M,               # <--- 对应 Kernel 的 num_valid_tokens
-            inter_size * 2,  # N
-            self.hidden_size,# K
+            num_blocks, M, inter_size * 2, self.hidden_size, 
             x.stride(0), x.stride(1),
             self.w13_stacked.stride(0), self.w13_stacked.stride(2), self.w13_stacked.stride(1),
             activated_out.stride(0), activated_out.stride(1),
-            BLOCK_SIZE_M=BLOCK_SIZE_M, 
-            BLOCK_SIZE_N=64, 
-            BLOCK_SIZE_K=32,
+            BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32, 
             GROUP_SIZE_M=GROUP_SIZE_M, 
         )
 
         combined_sparse_fp32 = torch.zeros(x.shape, device=x.device, dtype=torch.float32)
-        
         grid_w2 = lambda META: (num_blocks * triton.cdiv(self.hidden_size, META['BLOCK_SIZE_N']),)
         
         fused_moe_w2_combine_kernel[grid_w2](
             activated_out, self.w2_stacked, combined_sparse_fp32, flat_routing_weights,
             sorted_token_ids, sorted_weight_idx, expert_ids,
-            num_blocks,      # <--- 对应 Kernel 的 num_blocks
-            M,               # <--- 对应 Kernel 的 num_valid_tokens
-            self.hidden_size,# N
-            inter_size,      # K
+            num_blocks, M, self.hidden_size, inter_size,
             activated_out.stride(0), activated_out.stride(1),
             self.w2_stacked.stride(0), self.w2_stacked.stride(2), self.w2_stacked.stride(1),
             combined_sparse_fp32.stride(0), combined_sparse_fp32.stride(1),
-            BLOCK_SIZE_M=BLOCK_SIZE_M, 
-            BLOCK_SIZE_N=64, 
-            BLOCK_SIZE_K=32,
+            BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32, 
             GROUP_SIZE_M=GROUP_SIZE_M,
         )
 
-        return (shared_output + combined_sparse_fp32.to(model_dtype)).view(orig_shape)
+        if self.use_overlap:
+            torch.cuda.current_stream().wait_stream(self.shared_expert_stream)
+        
+        return (shared_out + combined_sparse_fp32.to(model_dtype)).view(orig_shape)
+
 
 class Qwen2MoeDecoderLayer(nn.Module):
     def __init__(
