@@ -46,7 +46,7 @@ if __name__ == "__main__":
     argparse.add_argument(
         "--model-path", type=str, default="/home/zerokernel_ac/huggingface/qwen/Qwen1.5-MoE-A2.7B-Chat"
     )
-    argparse.add_argument("--tensor-parallel-size", "--tp", type=int, default=1)
+    argparse.add_argument("--tensor-parallel-size", "--tp", type=int, default=4)
     argparse.add_argument("--enforce-eager", type=bool, default=True)
     argparse.add_argument("--temperature", type=float, default=0.6)
     argparse.add_argument("--max-tokens", type=int, default=256)

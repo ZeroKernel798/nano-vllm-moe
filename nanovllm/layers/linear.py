@@ -157,10 +157,12 @@ class RowParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
+        reduce_results=True,
     ):
         super().__init__(input_size, output_size, 1)
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
+        self.reduce_results = reduce_results
 
         self.weight = nn.Parameter(
             torch.empty(self.output_size, self.input_size_per_partition)
@@ -181,6 +183,6 @@ class RowParallelLinear(LinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
-        if self.tp_size > 1:
+        if self.tp_size > 1 and self.reduce_results:
             dist.all_reduce(y)
         return y
