@@ -10,9 +10,10 @@ def main(args):
     path = os.path.expanduser(args.model_path)
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(
-        path,
-        enforce_eager=args.enforce_eager,
-        tensor_parallel_size=args.tensor_parallel_size,
+        path, 
+        enforce_eager=args.enforce_eager, 
+        tp_size=args.tp_size,   
+        ep_size=args.ep_size,   
     )
 
     sampling_params = SamplingParams(
@@ -46,7 +47,8 @@ if __name__ == "__main__":
     argparse.add_argument(
         "--model-path", type=str, default="/home/zerokernel_ac/huggingface/qwen/Qwen1.5-MoE-A2.7B-Chat"
     )
-    argparse.add_argument("--tensor-parallel-size", "--tp", type=int, default=2)
+    argparse.add_argument("--tp-size", type=int, default=2)
+    argparse.add_argument("--ep-size", type=int, default=1)
     argparse.add_argument("--enforce-eager", type=bool, default=True)
     argparse.add_argument("--temperature", type=float, default=0.6)
     argparse.add_argument("--max-tokens", type=int, default=256)

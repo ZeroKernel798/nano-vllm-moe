@@ -20,7 +20,8 @@ def main(args):
     llm = LLM(
         path, 
         enforce_eager=args.enforce_eager, 
-        tensor_parallel_size=args.tensor_parallel_size,
+        tp_size=args.tp_size,    # 传给 Config
+        ep_size=args.ep_size,    # 传给 Config
     )
 
     # 3. 构造极高压力的随机负载
@@ -82,7 +83,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model-path", type=str, default="/home/zerokernel_ac/huggingface/qwen/Qwen1.5-MoE-A2.7B-Chat"
     )
-    parser.add_argument("--tensor-parallel-size", "--tp", type=int, default=4)
+    parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument("--ep-size", type=int, default=2)
     parser.add_argument("--enforce-eager", type=bool, default=True)
     
     # 增加压测参数配置

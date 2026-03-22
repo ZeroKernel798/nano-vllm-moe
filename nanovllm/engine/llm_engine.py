@@ -20,10 +20,11 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.world_size = config.tp_size * config.ep_size
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
+        for i in range(1, self.world_size):
             event = ctx.Event()
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
             process.start()
