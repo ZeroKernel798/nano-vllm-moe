@@ -1,37 +1,49 @@
 import torch
+def moe_align_block_size(topk_ids, num_experts, block_size, expert_map=None):
+    """
+    模拟 vLLM 的 C++ moe_align_block_size 逻辑 (完全体：返回 4 个值)
+    """
+    device = topk_ids.device
+    M, top_k = topk_ids.shape
+    num_total_tasks = M * top_k
+    
+    flat_topk_ids = topk_ids.view(-1)
+    flat_token_ids = torch.arange(M, device=device).repeat_interleave(top_k)
+    # 【核心】为了 W2 Combine Kernel 准备的全局任务索引
+    flat_weight_idx = torch.arange(num_total_tasks, device=device)
 
-# 辅助函数：严格的每专家隔离 Padding
-def moe_align_helper(selected_experts, BLOCK_SIZE_M, num_experts):
-    device = selected_experts.device
-    flat_expert_ids = selected_experts.reshape(-1)
-    
-    sorted_indices = torch.argsort(flat_expert_ids)
-    sorted_experts = flat_expert_ids[sorted_indices]
-    
-    tokens_per_expert = torch.bincount(flat_expert_ids, minlength=num_experts)
-    expert_blocks = (tokens_per_expert + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
-    
-    #  计算每个 Token 在 padding 后数组中的绝对安全位置
-    expert_starts = torch.cumsum(tokens_per_expert, dim=0) - tokens_per_expert
-    token_positions = torch.arange(len(sorted_indices), device=device) - expert_starts[sorted_experts]
-    
-    block_in_expert = token_positions // BLOCK_SIZE_M
-    pos_in_block = token_positions % BLOCK_SIZE_M
-    expert_block_starts = torch.cumsum(expert_blocks, dim=0) - expert_blocks
-    global_block_id = expert_block_starts[sorted_experts] + block_in_expert
-    
-    # padded_positions 就是有效 Token 应该放入的坑位，中间会留出 -1 的空隙给 Padding
-    padded_positions = global_block_id * BLOCK_SIZE_M + pos_in_block
-    
-    total_blocks = expert_blocks.sum().item()
-    padded_size = total_blocks * BLOCK_SIZE_M
-    
-    aligned_token_ids = torch.full((padded_size,), -1, dtype=torch.int32, device=device)
-    original_token_ids = (sorted_indices // selected_experts.shape[1]).to(torch.int32)
-    aligned_token_ids[padded_positions] = original_token_ids
+    tokens_per_expert = torch.bincount(flat_topk_ids, minlength=num_experts)
+    num_blocks_per_expert = (tokens_per_expert + block_size - 1) // block_size
+    total_blocks = num_blocks_per_expert.sum().item()
     
     expert_ids = torch.repeat_interleave(
-        torch.arange(num_experts, device=device), expert_blocks
+        torch.arange(num_experts, device=device), 
+        num_blocks_per_expert
     ).to(torch.int32)
     
-    return aligned_token_ids, expert_ids, total_blocks, padded_positions, original_token_ids, sorted_indices
+    if expert_map is not None:
+        expert_ids = expert_map[expert_ids.long()].to(torch.int32)
+
+    sort_idx = torch.argsort(flat_topk_ids)
+    sorted_tokens_raw = flat_token_ids[sort_idx]
+    sorted_weight_idx_raw = flat_weight_idx[sort_idx] # 【新增】
+    
+    token_ranks = torch.arange(num_total_tasks, device=device)
+    expert_offsets = torch.cumsum(tokens_per_expert, dim=0) - tokens_per_expert
+    rank_within_expert = token_ranks - expert_offsets[flat_topk_ids[sort_idx]]
+    
+    expert_block_offsets = torch.cumsum(num_blocks_per_expert, dim=0) - num_blocks_per_expert
+    padded_target_pos = expert_block_offsets[flat_topk_ids[sort_idx]] * block_size + rank_within_expert
+    
+    padded_size = total_blocks * block_size
+    
+    # 记录 Token 映射
+    sorted_token_ids = torch.full((padded_size,), M, dtype=torch.int32, device=device)
+    sorted_token_ids[padded_target_pos.long()] = sorted_tokens_raw.to(torch.int32)
+    
+    # 【新增】记录权重映射（对应 flat_routing_weights 的位置）
+    sorted_weight_idx = torch.full((padded_size,), num_total_tasks, dtype=torch.int32, device=device)
+    sorted_weight_idx[padded_target_pos.long()] = sorted_weight_idx_raw.to(torch.int32)
+    
+    # 记得返回这 4 个值！
+    return sorted_token_ids, sorted_weight_idx, expert_ids, total_blocks

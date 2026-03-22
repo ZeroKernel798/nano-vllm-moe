@@ -2,6 +2,7 @@ import atexit
 from dataclasses import fields
 from time import perf_counter
 
+import torch
 import torch.multiprocessing as mp
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -74,13 +75,18 @@ class LLMEngine:
         outputs = {}
         prefill_throughput = decode_throughput = 0.0
         while not self.is_finished():
+            torch.cuda.synchronize() 
             t = perf_counter()
+            
             output, num_tokens = self.step()
+            
+            torch.cuda.synchronize() 
+            step_time = perf_counter() - t
             if use_tqdm:
                 if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
+                    prefill_throughput = num_tokens / step_time
                 else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
+                    decode_throughput = -num_tokens / step_time
                 pbar.set_postfix(
                     {
                         "Prefill": f"{int(prefill_throughput)}tok/s",

@@ -81,7 +81,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="nano-vllm MoE Benchmark")
     parser.add_argument(
-        "--model-path", type=str, default="/root/autodl-tmp/models/qwen/Qwen1.5-MoE-A2.7B-Chat"
+        "--model-path", type=str, default="/home/zerokernel_ac/huggingface/qwen/Qwen1.5-MoE-A2.7B-Chat"
     )
     parser.add_argument("--tensor-parallel-size", "--tp", type=int, default=1)
     parser.add_argument("--enforce-eager", type=bool, default=True)
