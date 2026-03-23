@@ -92,11 +92,11 @@ python download_model.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
 | 阶段    |   测试配置   | 吞吐量 (Throughput) | TPOT (Latency) | 加速比 |  性能损耗/增益说明  |
 |---------|-------------|---------------------|---------------|--------|-------------------|
 | Decode | TP=1,EP=1,BS=1,L=4 | 9.28 tok/s | 107.56 ms | 1.00x | ----- |
-| Decode | TP=2,EP=2,BS=1,L=4 | 7.65 tok/s | 130.72 ms | 1.01x | 计算量极小，4 卡同步开销抵消了计算收益 |
-| Decode | TP=4,EP=1,BS=1,L=4 | 9.34 tok/s | 107.17 ms | 0.82x | 混合并行带来的同步延迟导致响应变慢 |
+| Decode | TP=2,EP=2,BS=1,L=4 | 7.65 tok/s | 130.72 ms | 0.82x | 混合并行带来的同步延迟导致响应变慢 |
+| Decode | TP=4,EP=1,BS=1,L=4 | 9.34 tok/s | 107.17 ms | 1.01x | 计算量极小，4 卡同步开销抵消了计算收益 |
 | Decode | TP=1,EP=1,BS=256,L=4 | 4864.58 tok/s | 53.00 ms | 1.00x | ----- | 
-| Decode | TP=2,EP=2,BS=256,L=4 | 2945.15 tok/s | 87.48 ms | 0.61x | 卡间 All-Reduce 耗时超过计算耗时 |
-| Decode | TP=4,EP=1,BS=256,L=4 | 4032.50 tok/s | 64.20 ms | 0.83x | 复杂的分布式链路导致性能大幅跌落 |
+| Decode | TP=2,EP=2,BS=256,L=4 | 2945.15 tok/s | 87.48 ms | 0.61x | 复杂的分布式链路导致性能大幅跌落 |
+| Decode | TP=4,EP=1,BS=256,L=4 | 4032.50 tok/s | 64.20 ms | 0.83x | 卡间 All-Reduce 耗时超过计算耗时 |
 > **Bottleneck analysis**: <small>
 经过对 Qwen-1.5-MoE-2.7B 的深度压测，我们发现多卡并行（TP/EP）在 decode 阶段表现不佳，这并非框架缺陷，而是由以下两个核心技术瓶颈决定的：
 1、计算密度不足。对于 2.7B 这样的小规模模型，Decode 阶段单次算子的执行时间（us级）已经接近甚至小于 NVLink 的同步延迟。在 TP 或 EP 模式下，多卡之间频繁的 all-reduce 或 all-to-all 通信开销完全盖过了并行带来的计算收益。在这种级别的计算任务面前，“力大砖飞”的分布式策略反而成了性能累赘。2、MoE 动态特性对 CUDA Graph 的局限。目前的 MoE 实现采用了动态的 Token 分发逻辑，这需要 CPU 实时介入来决定下一阶段的计算规模。这种数据依赖的动态调度与 CUDA Graph 要求的“全静态计算图”存在天然冲突，导致目前无法通过录制 Graph 来消除 Python 调度和 Kernel Launch 的 Overhead。这也是 BS=1 时 TPOT 难以进一步下探的技术原因。后续将考虑引入量化以及 MoE 逻辑重构，利用 CUDA Graph 进一步优化，全部测试结果见docs/pd_separate_report.md</small>
