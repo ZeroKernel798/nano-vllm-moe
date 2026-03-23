@@ -63,7 +63,6 @@ def run_single_test(args, tp, ep, output_file):
         with open(output_file, "a") as f:
             f.write(result_line + "\n")
 
-        # 必须调用 llm.exit() 来 join 子进程并销毁 process group
         llm.exit() 
         del llm
         gc.collect()
@@ -77,7 +76,6 @@ def run_single_test(args, tp, ep, output_file):
         return None
 
 def main(args):
-    # 定义要扫描的所有并行组合 (TP, EP)
     sweep_configs = [
         (1, 1),           # 1卡
         (1, 2), (2, 1),   # 2卡 (EP模式 vs TP模式)
@@ -99,7 +97,6 @@ def main(args):
     for tp, ep in sweep_configs:
         current_tp = run_single_test(args, tp, ep, output_file)
         
-        # 如果是单卡，记录为基准速度计算加速比
         if tp == 1 and ep == 1:
             baseline_tp = current_tp
 
@@ -109,7 +106,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="nano-vllm MoE Sweep Benchmark")
     parser.add_argument("--model-path", type=str, default="/home/zerokernel_ac/huggingface/qwen/Qwen1.5-MoE-A2.7B-Chat")
     
-    # 增加压测参数配置
     parser.add_argument("--num-seqs", type=int, default=256) 
     parser.add_argument("--max-input-len", type=int, default=512)
     parser.add_argument("--max-output-len", type=int, default=512)

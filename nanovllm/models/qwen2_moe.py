@@ -953,7 +953,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         layer_idx: int,
         tp_group: Optional[dist.ProcessGroup] = None,
         ep_group: Optional[dist.ProcessGroup] = None,
-        group_gemm_enable : bool = True
+        group_gemm_enable : bool = False
     ) -> None:
         super().__init__()
         self.self_attn = Qwen2MoeAttention(

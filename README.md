@@ -25,7 +25,26 @@ python download_model.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
 
 ## Benchmark
 
-可使用ep_tp_bench.py进行生产环境下的随机输入序列模拟测试
+使用 ep_bench.py 模拟生产环境下随机输入序列，测试Group-Gemm相关实现的性能
+
+**测试配置**
+- Hardware: NVIDIA A100-SXM4-80GB (HBM2e / NVLink)
+- Model: Qwen1.5-MoE-A2.7B-Chat
+- Total Requests: 256 sequences
+- Input Length: Randomly sampled between 128–1024 tokens
+- Output Length: Randomly sampled between 128–1024 tokens
+- Parallelism Strategy: TP = 1, EP = 1
+
+**测试结果:**
+|          实现方案          | 总输入 tokens | 总输出 tokens | 解码吞吐（tokens/s）| 总吞吐（tokens/s）|
+|---------------------------|---------------|--------------|--------------------|------------------|
+|        Python Loop        |     155216    |   153174     |      156.67        |      315.42      |      
+|     Triton Group-GEMM     |     155216    |   153174     |      1286.5        |      2590.1      |        
+|Triton Group-GEMM w Overlap|     155216    |   153174     |      1328.5        |      2674.7      |   
+
+
+
+可使用 ep_tp_bench.py 模拟生产环境下随机输入序列多卡推理测试，横向对比各种并行策略，一键生成测试结果
 
 **测试配置**
 - Hardware: NVIDIA A100-SXM4-80GB (HBM2e / NVLink)
@@ -33,14 +52,16 @@ python download_model.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
 - Total Requests: 256 sequences
 - Input Length: Randomly sampled between 128–512 tokens
 - Output Length: Randomly sampled between 128–512 tokens
+- Expert Execution Logic: Group-Gemm + Overlap
 
 **测试结果:**
-| 并行配置 | 显卡数 | 解码吞吐（tokens/s） | 总吞吐（tokens/s） |测试耗时|
-|---------|--------|--------------------|--------------------|-----|
-|TP=1, EP=1|Cards=1|Out_TP=2240.64|Total_TP=4609.59|Time=34.77s|
-|TP=1, EP=2|Cards=2|Out_TP=1937.79|Total_TP=3986.54|Time=40.20s|
-|TP=2, EP=1|Cards=2|Out_TP=2455.39|Total_TP=5051.39|Time=31.72s|
-|TP=2, EP=2|Cards=4|Out_TP=1821.96|Total_TP=3748.26|Time=42.75s|
-|TP=4, EP=1|Cards=4|Out_TP=2430.07|Total_TP=4999.32|Time=32.06s|
+| 并行配置  | 显卡数 | 解码吞吐（tokens/s） | 总吞吐（tokens/s） |测试耗时|
+|----------|-------|--------------------|--------------------|-----|
+|TP=1, EP=1|   1   |      2240.64       |     4609.59        |34.77s|
+|TP=1, EP=2|   2   |      1937.79       |     3986.54        |40.20s|
+|TP=2, EP=1|   2   |      2455.39       |     5051.39        |31.72s|
+|TP=2, EP=2|   4   |      1821.96       |     3748.26        |42.75s|
+|TP=4, EP=1|   4   |      2430.07       |     4999.32        |32.06s|
+
 
 
