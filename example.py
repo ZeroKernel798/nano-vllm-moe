@@ -34,12 +34,24 @@ def main(args):
         )
         for prompt in prompts
     ]
-    outputs = llm.generate(prompts, sampling_params)
+    response = llm.generate(prompts, sampling_params)
 
-    for prompt, output in zip(prompts, outputs):
+    for prompt, output_tokens in zip(prompts, response['results']):
+        # 手动调用 llm.tokenizer.decode
+        text = llm.tokenizer.decode(output_tokens)
         print("\n")
         print(f"Prompt: {prompt!r}")
-        print(f"Completion: {output['text']!r}")
+        print(f"Completion: {text!r}")
+
+    # 性能数据 
+    s = response['stats']
+    print(f"\n" + "="*30)
+    print(f"📊 推理性能报告:")
+    print(f"⏱️  总耗时: {s['total_time']:.2f}s")
+    print(f"🚀 Prefill 吞吐: {s['prefill_tps']:.2f} tok/s")
+    print(f"⚡ Decode 吞吐: {s['decode_tps']:.2f} tok/s")
+    print(f"⏳ 平均首词延迟 (TTFT): {s['avg_ttft_ms']:.2f} ms")
+    print("="*30)
 
 
 if __name__ == "__main__":
@@ -49,7 +61,7 @@ if __name__ == "__main__":
     )
     argparse.add_argument("--tp-size", type=int, default=1)
     argparse.add_argument("--ep-size", type=int, default=1)
-    argparse.add_argument("--enforce-eager", type=bool, default=True)
+    argparse.add_argument("--enforce-eager", type=bool, default=False)
     argparse.add_argument("--temperature", type=float, default=0.6)
     argparse.add_argument("--max-tokens", type=int, default=256)
     args = argparse.parse_args()
