@@ -1,0 +1,9 @@
+InferX MoE Parallelism Sweep Report
+Model: /home/zerokernel_ac/huggingface/qwen/Qwen1.5-MoE-A2.7B-Chat
+Seqs: 256, Max_In: 512, Max_Out: 512
+------------------------------------------------------------
+TP=1, EP=1, Cards=1, Out_TP=2240.64, Total_TP=4609.59, Time=34.77s
+TP=1, EP=2, Cards=2, Out_TP=1937.79, Total_TP=3986.54, Time=40.20s
+TP=2, EP=1, Cards=2, Out_TP=2455.39, Total_TP=5051.39, Time=31.72s
+TP=2, EP=2, Cards=4, Out_TP=1821.96, Total_TP=3748.26, Time=42.75s
+TP=4, EP=1, Cards=4, Out_TP=2430.07, Total_TP=4999.32, Time=32.06s

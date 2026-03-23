@@ -27,7 +27,7 @@ def main(args):
     # 3. 构造极高压力的随机负载
     print(f"Generating {num_seqs} random sequences for benchmarking...")
     prompt_token_ids = [
-        [randint(0, 10000) for _ in range(randint(100, max_input_len))]
+        [randint(0, 10000) for _ in range(randint(128, max_input_len))]
         for _ in range(num_seqs)
     ]
     
@@ -36,7 +36,7 @@ def main(args):
         SamplingParams(
             temperature=0.6, 
             ignore_eos=True, 
-            max_tokens=randint(100, max_output_len)
+            max_tokens=randint(128, max_output_len)
         )
         for _ in range(num_seqs)
     ]
@@ -83,7 +83,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model-path", type=str, default="/home/zerokernel_ac/huggingface/qwen/Qwen1.5-MoE-A2.7B-Chat"
     )
-    parser.add_argument("--tp-size", type=int, default=2)
+    parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--ep-size", type=int, default=1)
     parser.add_argument("--enforce-eager", type=bool, default=True)
     

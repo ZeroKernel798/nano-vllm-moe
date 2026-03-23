@@ -1,58 +1,46 @@
-# Nano-vLLM
+# Nano-vLLM-MOE
 
-A lightweight vLLM implementation built from scratch.
+本项目是以Nano-vLLM项目为基底，添加了对Qwen2、Qwen3系列的Moe模型支持，并提供了EP、TP以及EP、TP混合的调度实现。用于在现有的Nano-vLLM的基础上，学习和分析LLM的分布式并行策略。原项目地址为：https://github.com/GeeeekExplorer/nano-vllm.git
 
-## Key Features
+## 主要特点
 
-* 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+* 支持多种并行策略：支持单机多卡下的 TP、EP 以及 TP+EP 混合调度，可应对更复杂的分布式推理场景。
+* 高性能Triton算子：使用 Triton 实现了 Group-Gemm 等核心算子，显著降低 MoE 层通信延迟。
+* 特性继承：完整保留了原项目的 Prefix caching, Torch compilation 以及 CUDA graph 等生产级优化。
 
-## Installation
+## 安装
 
-```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
-```
+git clone https://github.com/ZeroKernel798/nano-vllm-moe.git
 
-## Manual Download
+cd nano-vllm-moe
 
-If you prefer to download the model weights manually, use the following command:
-```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
-```
+pip install -e .
 
-## Quick Start
+## 模型下载
 
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
-```python
-from nanovllm import LLM, SamplingParams
-llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
-sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
-outputs = llm.generate(prompts, sampling_params)
-outputs[0]["text"]
-```
+推荐使用内置的下载脚本从 ModelScope 极速获取模型
+
+python download_model.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
+
 
 ## Benchmark
 
-See `bench.py` for benchmark.
+可使用ep_tp_bench.py进行生产环境下的随机输入序列模拟测试
 
-**Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
+**测试配置**
+- Hardware: NVIDIA A100-SXM4-80GB (HBM2e / NVLink)
+- Model: Qwen1.5-MoE-A2.7B-Chat
 - Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
+- Input Length: Randomly sampled between 128–512 tokens
+- Output Length: Randomly sampled between 128–512 tokens
 
-**Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
+**测试结果:**
+| 并行配置 | 显卡数 | 解码吞吐（tokens/s） | 总吞吐（tokens/s） |测试耗时|
+|---------|--------|--------------------|--------------------|-----|
+|TP=1, EP=1|Cards=1|Out_TP=2240.64|Total_TP=4609.59|Time=34.77s|
+|TP=1, EP=2|Cards=2|Out_TP=1937.79|Total_TP=3986.54|Time=40.20s|
+|TP=2, EP=1|Cards=2|Out_TP=2455.39|Total_TP=5051.39|Time=31.72s|
+|TP=2, EP=2|Cards=4|Out_TP=1821.96|Total_TP=3748.26|Time=42.75s|
+|TP=4, EP=1|Cards=4|Out_TP=2430.07|Total_TP=4999.32|Time=32.06s|
 
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)

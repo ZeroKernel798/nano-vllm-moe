@@ -3,9 +3,8 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nano-vllm"
+name = "nano-vllm-moe"
 version = "0.2.0"
-authors = [{ name = "Xingkai Yu" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
@@ -20,7 +19,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage="https://github.com/ZeroKernel798/nano-vllm-moe"
 
 [tool.setuptools.packages.find]
 where = ["."]

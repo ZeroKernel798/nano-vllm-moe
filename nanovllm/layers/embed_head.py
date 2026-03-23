@@ -64,12 +64,18 @@ class ParallelLMHead(VocabParallelEmbedding):
         context = get_context()
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
-            x = x[last_indices].contiguous()
+            x = x[last_indices] 
         logits = F.linear(x, self.weight)
-        
         if self.tp_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
-            dist.gather(logits, all_logits, dst=0, group=self.tp_group)
-            logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
-            
+            group_ranks = dist.get_process_group_ranks(self.tp_group)
+            dst_global_rank = group_ranks[0] 
+
+            if self.tp_rank == 0:
+                all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)]
+                dist.gather(logits, all_logits, dst=dst_global_rank, group=self.tp_group)
+                logits = torch.cat(all_logits, dim=-1)
+            else:
+                dist.gather(logits, None, dst=dst_global_rank, group=self.tp_group)
+                logits = None 
+                
         return logits

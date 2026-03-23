@@ -76,18 +76,13 @@ class LLMEngine:
         outputs = {}
         prefill_throughput = decode_throughput = 0.0
         while not self.is_finished():
-            torch.cuda.synchronize() 
             t = perf_counter()
-            
             output, num_tokens = self.step()
-            
-            torch.cuda.synchronize() 
-            step_time = perf_counter() - t
             if use_tqdm:
                 if num_tokens > 0:
-                    prefill_throughput = num_tokens / step_time
+                    prefill_throughput = num_tokens / (perf_counter() - t)
                 else:
-                    decode_throughput = -num_tokens / step_time
+                    decode_throughput = -num_tokens / (perf_counter() - t)
                 pbar.set_postfix(
                     {
                         "Prefill": f"{int(prefill_throughput)}tok/s",
