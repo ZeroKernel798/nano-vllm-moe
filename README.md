@@ -4,9 +4,15 @@
 
 ## 主要特点
 
-* 支持多种并行策略：支持单机多卡下的 TP、EP 以及 TP+EP 混合调度，可应对更复杂的分布式推理场景。
-* 高性能Triton算子：使用 Triton 实现了 Group-Gemm 等核心算子，显著降低 MoE 层通信延迟。
-* 特性继承：完整保留了原项目的 Prefix caching, Torch compilation 以及 CUDA graph 等生产级优化。
+* Tensor Parallelism — Column/Row 并行分片策略，针对 Prefill 阶段矩阵计算进行深度拆解，显著提升计算密集型任务的硬件利用率
+* Expert Parallelism — 专为大规模 MoE 设计的专家分片架构，突破单卡 HBM 容量限制，支持超大规模专家库的高效驻留与并行调度
+* Hybrid TP+EP — 灵活的嵌套并行模式，允许根据集群 NVLink 带宽与模型规模动态调整并行粒度，实现通信与计算的最优平衡
+* Triton Group-GEMM — 使用 Triton 实现了 Group-Gemm 等核心算子，显著降低 MoE 层通信延迟
+* Expert Overlap Execution — 支持 Shared Expert 与 Sparse Expert 并行执行，利用计算掩盖 all-to-all 通信延迟
+* P/D Separate Benchmarking — 完善的性能评测套件，支持 Prefill 与 Decode 阶段的独立剖析，提供 TTFT、TPOT 等详细指标输出
+* Preserved Optimizations — 完整保留了原项目的 Prefix caching, Torch compilation 以及 CUDA graph 等生产级优化
+* MoE-Aware CUDA Graph — 计划绕过动态路由的同步限制，实现 MoE 全路径的 CUDA Graph 录制，目标大幅降低单用户 TPOT
+* Mixed-Precision Quantization — 规划支持 FP8 与 INT4 量化，用于缓解 Decode 阶段的带宽瓶颈，进一步推高生成吞吐
 
 ## 安装
 
