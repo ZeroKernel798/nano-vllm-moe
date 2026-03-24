@@ -61,52 +61,12 @@ class LLMEngine:
     def is_finished(self):
         return self.scheduler.is_finished()
 
-    # def generate(
-    #     self,
-    #     prompts: list[str] | list[list[int]],
-    #     sampling_params: SamplingParams | list[SamplingParams],
-    #     use_tqdm: bool = True,
-    # ) -> list[str]:
-    #     if use_tqdm:
-    #         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
-    #     if not isinstance(sampling_params, list):
-    #         sampling_params = [sampling_params] * len(prompts)
-    #     for prompt, sp in zip(prompts, sampling_params):
-    #         self.add_request(prompt, sp)
-    #     outputs = {}
-    #     prefill_throughput = decode_throughput = 0.0
-    #     while not self.is_finished():
-    #         t = perf_counter()
-    #         output, num_tokens = self.step()
-    #         if use_tqdm:
-    #             if num_tokens > 0:
-    #                 prefill_throughput = num_tokens / (perf_counter() - t)
-    #             else:
-    #                 decode_throughput = -num_tokens / (perf_counter() - t)
-    #             pbar.set_postfix(
-    #                 {
-    #                     "Prefill": f"{int(prefill_throughput)}tok/s",
-    #                     "Decode": f"{int(decode_throughput)}tok/s",
-    #                 }
-    #             )
-    #         for seq_id, token_ids in output:
-    #             outputs[seq_id] = token_ids
-    #             if use_tqdm:
-    #                 pbar.update(1)
-    #     outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
-    #     outputs = [
-    #         {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids}
-    #         for token_ids in outputs
-    #     ]
-    #     if use_tqdm:
-    #         pbar.close()
-    #     return outputs
     def generate(
         self,
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
-    ) -> dict: # 修改返回类型为 dict，带上统计数据
+    ) -> dict: 
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         
@@ -116,13 +76,12 @@ class LLMEngine:
             self.add_request(prompt, sp)
 
         outputs = {}
-        # --- 新增统计变量 ---
         stats = {
             "prefill_tokens": 0,
             "prefill_time": 0.0,
             "decode_tokens": 0,
             "decode_time": 0.0,
-            "ttft_sum": 0.0, # 用于计算平均首字延迟
+            "ttft_sum": 0.0, 
         }
         start_time = perf_counter()
         

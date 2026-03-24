@@ -10,7 +10,7 @@ class Config:
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 512
     max_model_len: int = 4096
-    gpu_memory_utilization: float = 0.7
+    gpu_memory_utilization: float = 0.65
     tp_size: int = 1
     ep_size: int = 1
     enforce_eager: bool = False

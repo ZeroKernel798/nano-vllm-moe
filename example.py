@@ -21,9 +21,9 @@ def main(args):
     )
     prompts = [
         "introduce yourself",
-        "list all prime numbers within 100",
-        "你好 请问你是谁",
-        "What is 123 + 456",
+        # "list all prime numbers within 100",
+        # "你好 请问你是谁",
+        # "What is 123 + 456",
     ]
     prompts = [
         tokenizer.apply_chat_template(
@@ -57,11 +57,11 @@ def main(args):
 if __name__ == "__main__":
     argparse = argparse.ArgumentParser(description="nano vllm")
     argparse.add_argument(
-        "--model-path", type=str, default="/home/zerokernel_ac/huggingface/qwen/Qwen1.5-MoE-A2.7B-Chat"
+        "--model-path", type=str, default="/home/zerokernel_ac/huggingface/qwen/Qwen3-30B-A3B"
     )
-    argparse.add_argument("--tp-size", type=int, default=1)
-    argparse.add_argument("--ep-size", type=int, default=1)
-    argparse.add_argument("--enforce-eager", type=bool, default=False)
+    argparse.add_argument("--tp-size", type=int, default=2)
+    argparse.add_argument("--ep-size", type=int, default=2)
+    argparse.add_argument("--enforce-eager", type=bool, default=True)
     argparse.add_argument("--temperature", type=float, default=0.6)
     argparse.add_argument("--max-tokens", type=int, default=256)
     args = argparse.parse_args()
