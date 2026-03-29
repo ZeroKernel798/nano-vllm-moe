@@ -56,11 +56,21 @@ def main(args):
 
 if __name__ == "__main__":
     argparse = argparse.ArgumentParser(description="nano vllm")
+    # argparse.add_argument(
+    #     "--model-path", type=str, default="/root/autodl-tmp/models/Llama-3.1-SmoothQuant-INT8"
+    # )
     argparse.add_argument(
-        "--model-path", type=str, default="/home/zerokernel_ac/huggingface/qwen/Qwen3-30B-A3B"
+        "--model-path", type=str, default="/root/autodl-tmp/models/LLM-Research/Meta-Llama-3.1-8B-Instruct"
     )
-    argparse.add_argument("--tp-size", type=int, default=2)
-    argparse.add_argument("--ep-size", type=int, default=2)
+    # argparse.add_argument(
+    #     "--model-path", type=str, default="/root/autodl-tmp/models/Llama-3.1-Pure-FP8"
+    # )
+    # argparse.add_argument(
+    #     "--model-path", type=str, default="/root/autodl-tmp/models/Llama-3.1-ModelOpt-FP8"
+    # )
+
+    argparse.add_argument("--tp-size", type=int, default=1)
+    argparse.add_argument("--ep-size", type=int, default=1)
     argparse.add_argument("--enforce-eager", type=bool, default=True)
     argparse.add_argument("--temperature", type=float, default=0.6)
     argparse.add_argument("--max-tokens", type=int, default=256)

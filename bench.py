@@ -13,7 +13,9 @@ def main():
     max_input_len = 1024
     max_ouput_len = 1024
 
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    # path = os.path.expanduser("/root/autodl-tmp/models/Llama-3.1-SmoothQuant-INT8")
+    # path = os.path.expanduser("/root/autodl-tmp/models/LLM-Research/Meta-Llama-3.1-8B-Instruct")
+    path = os.path.expanduser("/root/autodl-tmp/models/Llama-3.1-Pure-FP8")
     llm = LLM(path, enforce_eager=False, max_model_len=4096)
 
     prompt_token_ids = [
