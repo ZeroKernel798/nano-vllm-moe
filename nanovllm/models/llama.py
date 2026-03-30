@@ -271,7 +271,6 @@ from nanovllm.layers.linear import (
 )
 from nanovllm.layers.rotary_embedding import get_rope
 
-# 引入我们刚刚写好的高性能 FP8 算子
 from nanovllm.layers.fp8_linear import (
     FP8QKVParallelLinear,
     FP8MergedColumnParallelLinear,
@@ -283,6 +282,20 @@ from nanovllm.layers.smooth_quant_linear import (
     Int8MergedColumnParallelLinear,
     Int8RowParallelLinear,
 )
+
+
+def _fp8_scheme_from_config(config: LlamaConfig) -> str | None:
+    """Return ``w8a16`` or ``w8a8_static`` when FP8 is enabled; else ``None``."""
+    qc = getattr(config, "quantization_config", None)
+    if not isinstance(qc, dict) or qc.get("quant_method") != "fp8":
+        return None
+    scheme = qc.get("fp8_scheme")
+    if scheme in ("w8a16", "w8a8_static"):
+        return scheme
+    if qc.get("activation_scheme") == "static":
+        return "w8a8_static"
+    return "w8a16"
+
 
 class LlamaAttention(nn.Module):
     def __init__(self, config: LlamaConfig, hidden_size: int, num_heads: int, num_kv_heads: int, rope_theta: float = 10000, rope_scaling: tuple | None = None, max_position_embeddings: int = 8192, bias: bool = False, bias_o_proj: bool = False) -> None:
@@ -299,17 +312,26 @@ class LlamaAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
 
-        # 核心改动：极简配置路由，只判断是否为 FP8
-        # is_fp8 = getattr(config, "quantization_config", {}).get("quant_method") == "fp8"
+        quant = getattr(config, "quantization_config", {}) or {}
+        is_smoothquant = quant.get("quant_method") == "smoothquant"
+        fp8_scheme = _fp8_scheme_from_config(config)
 
-        is_fp8 = getattr(config, "quantization_config", {}).get("quant_method") == "fp8"
-        is_smoothquant = getattr(config, "quantization_config", {}).get("quant_method") == "smoothquant"
-        print(f"🔥 DEBUG ATTENTION: quant_config = {getattr(config, 'quantization_config', 'NONE')}, is_smoothquant = {is_smoothquant}")
-
-        if is_fp8:
-            self.qkv_proj = FP8QKVParallelLinear(hidden_size=hidden_size, head_size=self.head_dim, total_num_heads=self.total_num_heads, total_num_kv_heads=self.total_num_kv_heads, bias=bias)
-            self.o_proj = FP8RowParallelLinear(input_size=self.total_num_heads * self.head_dim, output_size=hidden_size, bias=bias_o_proj)
-        elif is_smoothquant: # 👈 添加 INT8 分支
+        if fp8_scheme is not None:
+            self.qkv_proj = FP8QKVParallelLinear(
+                hidden_size=hidden_size,
+                head_size=self.head_dim,
+                total_num_heads=self.total_num_heads,
+                total_num_kv_heads=self.total_num_kv_heads,
+                bias=bias,
+                fp8_scheme=fp8_scheme,
+            )
+            self.o_proj = FP8RowParallelLinear(
+                input_size=self.total_num_heads * self.head_dim,
+                output_size=hidden_size,
+                bias=bias_o_proj,
+                fp8_scheme=fp8_scheme,
+            )
+        elif is_smoothquant:
             self.qkv_proj = Int8QKVParallelLinear(hidden_size=hidden_size, head_size=self.head_dim, total_num_heads=self.total_num_heads, total_num_kv_heads=self.total_num_kv_heads, bias=bias)
             self.o_proj = Int8RowParallelLinear(input_size=self.total_num_heads * self.head_dim, output_size=hidden_size, bias=bias_o_proj)
         else:
@@ -332,14 +354,23 @@ class LlamaMLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int, hidden_act: str, bias: bool = False, config=None) -> None:
         super().__init__()
 
-        # 同样极简的 FP8 路由
-        is_fp8 = getattr(config, "quantization_config", {}).get("quant_method") == "fp8"
-        is_smoothquant = getattr(config, "quantization_config", {}).get("quant_method") == "smoothquant"
-        
-        if is_fp8:
-            self.gate_up_proj = FP8MergedColumnParallelLinear(input_size=hidden_size, output_sizes=[intermediate_size] * 2, bias=bias)
-            self.down_proj = FP8RowParallelLinear(input_size=intermediate_size, output_size=hidden_size, bias=bias)
-        elif is_smoothquant: # 👈 添加 INT8 分支
+        fp8_scheme = _fp8_scheme_from_config(config)
+        is_smoothquant = (getattr(config, "quantization_config", {}) or {}).get("quant_method") == "smoothquant"
+
+        if fp8_scheme is not None:
+            self.gate_up_proj = FP8MergedColumnParallelLinear(
+                input_size=hidden_size,
+                output_sizes=[intermediate_size] * 2,
+                bias=bias,
+                fp8_scheme=fp8_scheme,
+            )
+            self.down_proj = FP8RowParallelLinear(
+                input_size=intermediate_size,
+                output_size=hidden_size,
+                bias=bias,
+                fp8_scheme=fp8_scheme,
+            )
+        elif is_smoothquant:
             self.gate_up_proj = Int8MergedColumnParallelLinear(input_size=hidden_size, output_sizes=[intermediate_size] * 2, bias=bias)
             self.down_proj = Int8RowParallelLinear(input_size=intermediate_size, output_size=hidden_size, bias=bias)
         else:

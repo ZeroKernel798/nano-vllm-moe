@@ -106,3 +106,66 @@ python download_model.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
 > **Bottleneck analysis**: <small>
 经过对 Qwen-1.5-MoE-2.7B 的深度压测，我们发现多卡并行（TP/EP）在 decode 阶段表现不佳，这并非框架缺陷，而是由以下两个核心技术瓶颈决定的：
 1、计算密度不足。对于 2.7B 这样的小规模模型，Decode 阶段单次算子的执行时间（us级）已经接近甚至小于 NVLink 的同步延迟。在 TP 或 EP 模式下，多卡之间频繁的 all-reduce 或 all-to-all 通信开销完全盖过了并行带来的计算收益。在这种级别的计算任务面前，“力大砖飞”的分布式策略反而成了性能累赘。2、MoE 动态特性对 CUDA Graph 的局限。目前的 MoE 实现采用了动态的 Token 分发逻辑，这需要 CPU 实时介入来决定下一阶段的计算规模。这种数据依赖的动态调度与 CUDA Graph 要求的“全静态计算图”存在天然冲突，导致目前无法通过录制 Graph 来消除 Python 调度和 Kernel Launch 的 Overhead。这也是 BS=1 时 TPOT 难以进一步下探的技术原因。后续将考虑引入量化以及 MoE 逻辑重构，利用 CUDA Graph 进一步优化，全部测试结果见docs/pd_separate_report.md</small>
+
+## Llama 3.1 8B 量化与基线对比（RTX 4090，单卡）
+
+以下数据来自本仓库中的 `bench.py`、`pd_bench.py` 与 WikiText 困惑度脚本，详细原始表格见 `docs/fp8_bf16_bench.md`、`docs/pd_separate_report_bf16.md`、`docs/pd_separate_report_fp8_w8a8.md`、`docs/pd_separate_report_fp8_w8a16.md` 与 `docs/wikitext.md`。硬件为 **NVIDIA GeForce RTX 4090**，模型为 **Meta Llama 3.1 8B** 系列；P/D 测试为 **TP=1, EP=1**。
+
+### 端到端混合负载（bench.py）
+
+**测试配置（与 `docs/fp8_bf16_bench.md` 一致）**
+
+- Hardware: NVIDIA GeForce RTX 4090
+- Model: Llama 3.1 8B（BF16 基座 / W8A8 ModelOpt 导出 / W8A16 纯权重量化导出）
+- Parallelism: TP = 1, EP = 1
+- Sequences: 256
+- Input / output length: 随机长度（`--random-lens`），上界为 1024 tokens
+- max_model_len: 4096
+
+**测试结果（引擎统计）**
+
+| 方案 | wall_time (s) | prefill_tps | decode_tps | total_gen_tokens |
+|------|---------------|-------------|------------|------------------|
+| BF16 基线 | 74.900 | 11070.90 | 2454.68 | 133966 |
+| FP8 W8A8 | 69.216 | 12908.28 | 2620.51 | 133966 |
+| FP8 W8A16 | 99.906 | 4182.87 | 2858.90 | 133966 |
+
+*分析要点：* 在相同随机负载与总生成 token 数下，**W8A8** 总墙钟时间最短，prefill / decode 吞吐均高于 BF16，说明静态 FP8 激活 + FP8 权重路径在本机与 cuBLASLt 组合下对混合负载更友好。**W8A16** 的 prefill_tps 明显偏低而 decode_tps 高于 BF16，与「prefill 偏算力、W8A16 Triton 路径与 BF16 主路径效率差异；decode 偏权重带宽、FP8 权重量更省」的典型现象一致。
+
+### Prefill / Decode 阶段分离（pd_bench.py）
+
+**测试配置**
+
+- Hardware: NVIDIA GeForce RTX 4090
+- Model: 同上，单卡 TP=1, EP=1
+- Prefill：多组 (batch, seq_len)；
+- Decode：短提示 + 长生成阶段下的 batch 扫描
+
+**代表性对比（摘自分报告，单位 tok/s）**
+
+| 阶段 | 配置 | BF16 | W8A8 | W8A16 |
+|------|------|------|------|-------|
+| Prefill | BS=32, L=512 | 10994.44 | 11209.68 | 9712.15 |
+| Prefill | BS=32, L=4096 | 10081.92 | 10452.48 | 9027.82 |
+| Decode | BS=1, L=4 | 60.40 | 79.53 | 80.59 |
+| Decode | BS=256, L=4 | 7686.51 | 9404.59 | 7010.33 |
+
+*分析要点：* **Prefill** 上 BF16 在多数配置下略逊于或接近 W8A8，W8A16 普遍低于 BF16（大块 GEMM 上 BF16 Tensor Core 主路径仍很成熟）。**Decode** 上 W8A8 在中高 batch 下相对 BF16 提升明显（权重更省带宽）；W8A16 在 BS=1 略优，在 BS=256 时低于 BF16，与实现路径和 batch 形态有关。完整矩阵见上述 `docs/pd_separate_report_*.md`。
+
+### WikiText-2 困惑度（eval_ppl_wikitext.py / eval_ppl_nano_fp8.py）
+
+**测试配置**
+
+- Dataset: wikitext-2-raw-v1，split=test
+- 滑动窗口：max_length=2048，stride=512（与 `docs/wikitext.md` 中记录一致）
+- FP8 侧：将 nano 导出权重反量化为 BF16 后走 HF 前向（见 `eval_ppl_nano_fp8.py` 说明；W8A8 真实推理仍含激活量化，该数值为权重侧可比的乐观上界）
+
+**测试结果**
+
+| 模型 | WikiText-2 (test) perplexity |
+|------|------------------------------|
+| BF16 基线 | ≈ 6.4008 |
+| FP8 W8A8（反量化评估） | ≈ 6.4207 |
+| FP8 W8A16（反量化评估） | ≈ 6.4208 |
+
+*分析要点：* 三者困惑度差距在 **约 0.02（相对变化不足 0.4%）** 量级，说明当前 FP8 导出在语言建模指标上与 BF16 非常接近；W8A8 与 W8A16 的反量化 PPL 几乎相同，主要反映**权重量化**带来的差异，与「W8A8 激活量化未在 HF 评估中完全复现」的设定一致。

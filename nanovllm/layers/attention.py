@@ -1,3 +1,10 @@
+"""Multi-head attention with paged KV and FlashAttention.
+
+KV quantization: the runtime path here must match ``flash_attn`` CUDA expectations (bf16/fp16
+cache). For a staged rollout of FP8 (or other) KV storage, see ``nanovllm.utils.kv_cache`` and
+``nanovllm.layers.kv_cache_kernels`` (experimental FP8 *store* only).
+"""
+
 import torch
 import triton
 import triton.language as tl

@@ -1,4 +1,4 @@
-# P/D阶段独立测试数据
+# P/D阶段独立测试数据 A100 Qwen1.5-Moe
 | 阶段 | 测试配置 | 吞吐量 (Throughput) | 延迟 (Latency) |
 | Prefill | TP=1,EP=1,BS=32,L=512 | 26829.43 tok/s | 611.87 ms |
 | Prefill | TP=2,EP=1,BS=32,L=512 | 38212.05 tok/s | 429.60 ms |

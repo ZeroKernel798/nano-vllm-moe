@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 
 from nanovllm.config import Config
+from nanovllm.utils.kv_cache import kv_cache_bytes_per_element, normalize_kv_cache_dtype
 from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.sampler import Sampler
 from nanovllm.models.models import model_dict
@@ -147,13 +148,18 @@ class ModelRunner:
             if hasattr(hf_config, "head_dim")
             else hf_config.hidden_size // hf_config.num_attention_heads
         )
+        # FP8 path (not enabled yet): 1 byte; BF16/FP16 path: match model weight/activation dtype size.
+        if normalize_kv_cache_dtype(config.kv_cache_dtype) == "bf16":
+            kv_bpe = hf_config.torch_dtype.itemsize
+        else:
+            kv_bpe = kv_cache_bytes_per_element(config.kv_cache_dtype)
         block_bytes = (
             2
             * hf_config.num_hidden_layers
             * self.block_size
             * num_kv_heads
             * head_dim
-            * hf_config.torch_dtype.itemsize
+            * kv_bpe
         )
         config.num_kvcache_blocks = (
             int(total * config.gpu_memory_utilization - used - peak + current)
@@ -167,6 +173,7 @@ class ModelRunner:
             self.block_size,
             num_kv_heads,
             head_dim,
+            dtype=hf_config.torch_dtype,
         )
         layer_id = 0
         for module in self.model.modules():

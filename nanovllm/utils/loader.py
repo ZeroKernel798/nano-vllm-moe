@@ -142,7 +142,14 @@ def load_model(model: nn.Module, path: str):
                 base_name = weight_name
                 suffix = ""
                 # 兼容普通权重(.weight)和AWQ权重
-                if len(parts) == 2 and parts[1] in ["qweight", "qzeros", "scales", "weight"]:
+                if len(parts) == 2 and parts[1] in [
+                    "qweight",
+                    "qzeros",
+                    "scales",
+                    "weight",
+                    "weight_scale",
+                    "input_scale",
+                ]:
                     base_name = parts[0]
                     suffix = "." + parts[1]
 
