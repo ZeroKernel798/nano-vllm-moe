@@ -119,10 +119,10 @@ python download_model.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
 - Model: Llama 3.1 8B（BF16 基座 / W8A8 ModelOpt 导出 / W8A16 纯权重量化导出）
 - Parallelism: TP = 1, EP = 1
 - Sequences: 256
-- Input / output length: 随机长度（`--random-lens`），上界为 1024 tokens
+- Input / output length: 随机长度（`--random-lens`），上界为 1024 tokens，下界为 100 tokens
 - max_model_len: 4096
 
-**测试结果（引擎统计）**
+**测试结果**
 
 | 方案 | wall_time (s) | prefill_tps | decode_tps | total_gen_tokens |
 |------|---------------|-------------|------------|------------------|
@@ -141,7 +141,7 @@ python download_model.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
 - Prefill：多组 (batch, seq_len)；
 - Decode：短提示 + 长生成阶段下的 batch 扫描
 
-**代表性对比（摘自分报告，单位 tok/s）**
+**代表性对比（摘自数据报告，单位 tok/s）**
 
 | 阶段 | 配置 | BF16 | W8A8 | W8A16 |
 |------|------|------|------|-------|
@@ -158,7 +158,7 @@ python download_model.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
 
 - Dataset: wikitext-2-raw-v1，split=test
 - 滑动窗口：max_length=2048，stride=512（与 `docs/wikitext.md` 中记录一致）
-- FP8 侧：将 nano 导出权重反量化为 BF16 后走 HF 前向（见 `eval_ppl_nano_fp8.py` 说明；W8A8 真实推理仍含激活量化，该数值为权重侧可比的乐观上界）
+- FP8 侧：鉴于 HuggingFace 原生框架不支持 FP8 算子，采用反量化代理评估（De-quantization Proxy），即将 FP8 权重还原为 BF16 后进行推理。该指标反映了 **权重量化（Weight Quantization）** 带来的精度损耗上限
 
 **测试结果**
 
