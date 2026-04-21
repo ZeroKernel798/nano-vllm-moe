@@ -104,7 +104,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="nano-vllm MoE Sweep Benchmark")
-    parser.add_argument("--model-path", type=str, default="/home/zerokernel_ac/huggingface/qwen/Qwen1.5-MoE-A2.7B-Chat")
+    parser.add_argument("--model-path", type=str, default="/workspace/models/qwen/Qwen1.5-MoE-A2.7B-Chat")
     
     parser.add_argument("--num-seqs", type=int, default=256) 
     parser.add_argument("--max-input-len", type=int, default=512)
@@ -112,7 +112,7 @@ if __name__ == "__main__":
     
     parser.add_argument("--enforce-eager", type=bool, default=True)
     
-    parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument("--tp-size", type=int, default=2)
     parser.add_argument("--ep-size", type=int, default=1)
 
     args = parser.parse_args()

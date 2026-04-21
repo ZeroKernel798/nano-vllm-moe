@@ -12,14 +12,14 @@ def download_model():
     parser.add_argument(
         "--model-id", 
         type=str, 
-        default="LLM-Research/Meta-Llama-3.1-8B-Instruct",
+        default="qwen/Qwen1.5-MoE-A2.7B-Chat",
         help="ModelScope 上的模型 ID (建议使用 Instruct 结尾的对话版)"
     )
     
     parser.add_argument(
         "--cache-dir", 
         type=str, 
-        default="/root/autodl-tmp/models/",
+        default="/workspace/models/",
         help="模型存储路径"
     )
     
@@ -45,5 +45,3 @@ if __name__ == "__main__":
     download_model()
 
 
-
-# source /etc/network_turbo && nohup python downmodel.py > download.log 2>&1 &

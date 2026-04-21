@@ -13,7 +13,11 @@ def main(args):
         path, 
         enforce_eager=args.enforce_eager, 
         tp_size=args.tp_size,   
-        ep_size=args.ep_size,   
+        ep_size=args.ep_size,
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        max_num_seqs=args.max_num_seqs,
+        gpu_memory_utilization=args.gpu_memory_utilization,
     )
 
     sampling_params = SamplingParams(
@@ -63,11 +67,15 @@ if __name__ == "__main__":
     #     "--model-path", type=str, default="/root/autodl-tmp/models/Meta-Llama-3.1-8B-FP8-Static"
     # )
     argparse.add_argument(
-        "--model-path", type=str, default="/root/autodl-tmp/models/Llama-3.1-Pure-FP8-W8A16"
+        "--model-path", type=str, default="/workspace/models/qwen/Qwen1.5-0.5B-Chat"
     )
 
     argparse.add_argument("--tp-size", type=int, default=1)
     argparse.add_argument("--ep-size", type=int, default=1)
+    argparse.add_argument("--max-model-len", type=int, default=1024)
+    argparse.add_argument("--max-num-batched-tokens", type=int, default=1024)
+    argparse.add_argument("--max-num-seqs", type=int, default=1)
+    argparse.add_argument("--gpu-memory-utilization", type=float, default=0.7)
     argparse.add_argument(
         "--enforce-eager",
         action="store_true",

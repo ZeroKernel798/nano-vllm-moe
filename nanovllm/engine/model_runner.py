@@ -1,4 +1,5 @@
 import pickle
+import inspect
 from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.synchronize import Event
 
@@ -53,11 +54,14 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = model_dict[hf_config.model_type](
-            hf_config, 
-            tp_group=self.tp_group, 
-            ep_group=self.ep_group
-        )
+        model_cls = model_dict[hf_config.model_type]
+        model_init_params = inspect.signature(model_cls.__init__).parameters
+        model_kwargs = {}
+        if "tp_group" in model_init_params:
+            model_kwargs["tp_group"] = self.tp_group
+        if "ep_group" in model_init_params:
+            model_kwargs["ep_group"] = self.ep_group
+        self.model = model_cls(hf_config, **model_kwargs)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
