@@ -26,7 +26,7 @@ pip install -e .
 
 推荐使用内置的下载脚本从 ModelScope 极速获取模型
 
-python scripts/tools/downmodel.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
+python scripts/tools/downmodel.py --model-id qwen/Qwen1.5-MoE-A2.7B-Chat --cache-dir ./my_models
 
 
 ## Benchmark

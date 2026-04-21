@@ -1,7 +1,11 @@
 import argparse
 import os
+import sys
+from pathlib import Path
 
 from transformers import AutoTokenizer
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from nanovllm import LLM, SamplingParams
 

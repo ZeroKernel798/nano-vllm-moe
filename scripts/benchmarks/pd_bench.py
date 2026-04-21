@@ -1,8 +1,13 @@
 import argparse
 import os
 import gc
+import sys
+from pathlib import Path
 import torch
 from random import randint
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from nanovllm import LLM, SamplingParams
 
 

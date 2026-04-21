@@ -1,4 +1,5 @@
 import os
+import re
 import warnings
 from glob import glob
 
@@ -6,7 +7,7 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
-def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor):
+def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor, *args):
     # 注意：这里的 param 可能是 nn.Parameter 也可能是 Buffer(Tensor)
     param.data.copy_(loaded_weight)
 
@@ -20,6 +21,22 @@ def get_param_or_buffer(model: nn.Module, tensor_name: str):
         except AttributeError:
             return None
 
+
+MOE_EXPERT_RE = re.compile(
+    r"^model\.layers\.(?P<layer_idx>\d+)\.mlp\.experts\.(?P<expert_id>\d+)\.(?P<proj_name>gate_proj|up_proj|down_proj)\.(?P<suffix>weight|qweight|qzeros|scales|weight_scale|input_scale)$"
+)
+
+
+def parse_moe_expert_weight_name(weight_name: str):
+    match = MOE_EXPERT_RE.match(weight_name)
+    if match is None:
+        return None
+    return {
+        "layer_idx": match.group("layer_idx"),
+        "expert_id": int(match.group("expert_id")),
+        "proj_name": match.group("proj_name"),
+    }
+
 def load_model(model: nn.Module, path: str):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     unmatched_keys: list[str] = []
@@ -30,11 +47,11 @@ def load_model(model: nn.Module, path: str):
                 loaded_weight = f.get_tensor(weight_name)
                 
                 # 拦截 MoE 专家权重的逻辑 (完全保留你的原有逻辑)
-                if "mlp.experts" in weight_name:
-                    parts = weight_name.split(".")
-                    layer_idx = parts[2]
-                    expert_id = int(parts[5])
-                    proj_name = parts[6]
+                moe_info = parse_moe_expert_weight_name(weight_name)
+                if moe_info is not None:
+                    layer_idx = moe_info["layer_idx"]
+                    expert_id = moe_info["expert_id"]
+                    proj_name = moe_info["proj_name"]
                     
                     prefix = f"model.layers.{layer_idx}.mlp."
                     
@@ -46,12 +63,18 @@ def load_model(model: nn.Module, path: str):
                             shard_id = 0 if proj_name == "gate_proj" else 1
                             param = get_param_or_buffer(model, param_name)
                             if param is not None:
-                                param.weight_loader(param, loaded_weight, expert_id, shard_id)
+                                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                                weight_loader(param, loaded_weight, expert_id, shard_id)
+                            else:
+                                unmatched_keys.append(weight_name)
                         elif proj_name == "down_proj":
                             param_name = prefix + "w2_stacked"
                             param = get_param_or_buffer(model, param_name)
                             if param is not None:
-                                param.weight_loader(param, loaded_weight, expert_id)
+                                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                                weight_loader(param, loaded_weight, expert_id)
+                            else:
+                                unmatched_keys.append(weight_name)
                         
                         print(f"Loaded {weight_name} into {param_name}[{expert_id}]")
                         continue 

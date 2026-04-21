@@ -24,10 +24,13 @@ import argparse
 import json
 import os
 import random
+import sys
 from pathlib import Path
 from time import perf_counter
 
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from nanovllm import LLM, SamplingParams
 

@@ -10,15 +10,19 @@ def download_model():
     # 修改点：将默认 ID 改为 Instruct 版本
     # 如果显存足够（建议 8G 以上），可以将 default 改为 "LLM-Research/Llama-3.2-3B-Instruct"
     parser.add_argument(
-        "--model-id", 
-        type=str, 
+        "--model-id",
+        "--model",
+        dest="model_id",
+        type=str,
         default="qwen/Qwen1.5-MoE-A2.7B-Chat",
         help="ModelScope 上的模型 ID (建议使用 Instruct 结尾的对话版)"
     )
     
     parser.add_argument(
-        "--cache-dir", 
-        type=str, 
+        "--cache-dir",
+        "--path",
+        dest="cache_dir",
+        type=str,
         default="/workspace/models/",
         help="模型存储路径"
     )

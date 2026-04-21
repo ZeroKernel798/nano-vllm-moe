@@ -2,7 +2,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
-import triton
 from typing import Optional
 
 from transformers import Qwen3MoeConfig 
@@ -16,8 +15,7 @@ from nanovllm.layers.linear import (
     RowParallelLinear,
 )
 from nanovllm.layers.rotary_embedding import get_rope
-from nanovllm.kernels.group_gemm import fused_moe_w13_kernel, fused_moe_w2_combine_kernel
-from nanovllm.utils.moe import moe_align_block_size
+from nanovllm.executor.moe.backends import TritonMoEBackend
 
 class Qwen3MoeAttention(nn.Module):
     def __init__(
@@ -211,6 +209,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
         self.ep_size = dist.get_world_size(ep_group) if ep_group is not None else 1
         self.ep_rank = dist.get_rank(ep_group) if ep_group is not None else 0
+        self.backend = TritonMoEBackend(tp_group=tp_group, ep_group=ep_group)
         
         self.local_num_experts = self.global_num_experts // self.ep_size
         self.local_inter_size = self.moe_intermediate_size // self.tp_size
@@ -265,84 +264,44 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         topk_weights = topk_weights.to(torch.float32)
 
         # 2. EP Token 分发 (All-To-All)
-        if self.ep_size <= 1:
-            recv_x = x.repeat_interleave(self.top_k, dim=0)
-            recv_local_ids = topk_ids.flatten()
-            recv_weights = topk_weights.flatten()
-            num_recv = recv_x.shape[0]
-            permute_indices = torch.arange(num_recv, device=x.device)
-            s_list = [num_recv]
-            r_list = [num_recv]
-        else:
-            target_ep_ranks = torch.div(topk_ids, self.local_num_experts, rounding_mode='floor').clamp(0, self.ep_size - 1)
-            flat_target_ep_ranks = target_ep_ranks.flatten()
-            permute_indices = torch.argsort(flat_target_ep_ranks)
-            
-            expanded_x = x.repeat_interleave(self.top_k, dim=0) 
-            dispatched_x = expanded_x[permute_indices]
-            
-            send_counts = torch.bincount(flat_target_ep_ranks, minlength=self.ep_size).to(torch.long).to(x.device)
-            recv_counts = torch.empty_like(send_counts)
-            dist.all_to_all_single(recv_counts, send_counts, group=self.ep_group)
-
-            s_list, r_list = send_counts.tolist(), recv_counts.tolist()
-            num_recv = recv_counts.sum().item()
-            
-            recv_x = torch.empty(num_recv, H, device=x.device, dtype=x.dtype)
-            recv_local_ids = torch.empty(num_recv, dtype=torch.long, device=x.device)
-            recv_weights = torch.empty(num_recv, dtype=torch.float32, device=x.device)
-
-            dist.all_to_all_single(recv_x, dispatched_x, r_list, s_list, group=self.ep_group)
-            dist.all_to_all_single(recv_local_ids, (topk_ids % self.local_num_experts).flatten()[permute_indices], r_list, s_list, group=self.ep_group)
-            dist.all_to_all_single(recv_weights, topk_weights.flatten()[permute_indices], r_list, s_list, group=self.ep_group)
+        dispatch_state = self.backend.dispatch(
+            x=x,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            local_num_experts=self.local_num_experts,
+            top_k=self.top_k,
+        )
+        recv_x = dispatch_state["recv_x"]
+        recv_local_ids = dispatch_state["recv_local_ids"]
+        recv_weights = dispatch_state["recv_weights"]
+        permute_indices = dispatch_state["permute_indices"]
+        s_list = dispatch_state["s_list"]
+        r_list = dispatch_state["r_list"]
 
         # 3. 执行 Triton Group-GEMM
-        BLOCK_SIZE_M, GROUP_SIZE_M = 32, 8 
-        sorted_token_ids, sorted_weight_idx, expert_ids, num_blocks = moe_align_block_size(
-            recv_local_ids.view(-1, 1), self.local_num_experts, BLOCK_SIZE_M
-        )
-        
-        activated_out = torch.empty((num_recv, self.local_inter_size), device=x.device, dtype=model_dtype)
-        grid_w13 = lambda META: (num_blocks * triton.cdiv(self.local_inter_size, META['BLOCK_SIZE_N']),)
-        fused_moe_w13_kernel[grid_w13](
-            recv_x, self.w13_stacked, activated_out,
-            sorted_token_ids, sorted_weight_idx, expert_ids,
-            num_blocks, num_recv, self.local_inter_size * 2, self.hidden_size, 
-            recv_x.stride(0), recv_x.stride(1),
-            self.w13_stacked.stride(0), self.w13_stacked.stride(2), self.w13_stacked.stride(1),
-            activated_out.stride(0), activated_out.stride(1),
-            BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32, GROUP_SIZE_M=GROUP_SIZE_M, 
+        local_out_fp32 = self.backend.compute(
+            recv_x=recv_x,
+            recv_local_ids=recv_local_ids,
+            recv_weights=recv_weights,
+            w13_stacked=self.w13_stacked,
+            w2_stacked=self.w2_stacked,
+            local_num_experts=self.local_num_experts,
+            local_inter_size=self.local_inter_size,
+            hidden_size=self.hidden_size,
+            model_dtype=model_dtype,
         )
 
-        local_out_fp32 = torch.zeros((num_recv, self.hidden_size), device=x.device, dtype=torch.float32)
-        grid_w2 = lambda META: (num_blocks * triton.cdiv(self.hidden_size, META['BLOCK_SIZE_N']),)
-        fused_moe_w2_combine_kernel[grid_w2](
-            activated_out, self.w2_stacked, local_out_fp32, recv_weights,
-            sorted_token_ids, sorted_weight_idx, expert_ids,
-            num_blocks, num_recv, self.hidden_size, self.local_inter_size,
-            activated_out.stride(0), activated_out.stride(1),
-            self.w2_stacked.stride(0), self.w2_stacked.stride(2), self.w2_stacked.stride(1),
-            local_out_fp32.stride(0), local_out_fp32.stride(1),
-            BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32, GROUP_SIZE_M=GROUP_SIZE_M,
+        # 4/5/6. 回收 + 规约
+        output = self.backend.combine(
+            local_out_fp32=local_out_fp32,
+            model_dtype=model_dtype,
+            m_tokens=M,
+            hidden_size=H,
+            top_k=self.top_k,
+            permute_indices=permute_indices,
+            s_list=s_list,
+            r_list=r_list,
         )
-
-        # 4. EP Token 回收 (All-To-All)
-        if self.ep_size > 1:
-            combined_x = torch.empty(M * self.top_k, H, device=x.device, dtype=model_dtype)
-            dist.all_to_all_single(combined_x, local_out_fp32.to(model_dtype), s_list, r_list, group=self.ep_group)
-        else:
-            combined_x = local_out_fp32.to(model_dtype)
-        
-        # 5. Token 规约 (Sum)
-        sparse_out_flat = torch.zeros((M * self.top_k, H), device=x.device, dtype=model_dtype)
-        sparse_out_flat[permute_indices] = combined_x
-        output = sparse_out_flat.view(M, self.top_k, H).sum(dim=1)
-
-        # 6. TP 结果规约 (All-Reduce)
-        # 注意：因为没有 Shared Expert，所以 output 直接就是 sparse_out 的结果
-        if self.tp_size > 1:
-            dist.all_reduce(output, group=self.tp_group)
-
         return output.view(orig_shape)
 
 
