@@ -80,6 +80,7 @@
 
 
 import os
+import warnings
 from glob import glob
 
 import torch
@@ -102,6 +103,7 @@ def get_param_or_buffer(model: nn.Module, tensor_name: str):
 
 def load_model(model: nn.Module, path: str):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    unmatched_keys: list[str] = []
     
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
@@ -165,6 +167,8 @@ def load_model(model: nn.Module, path: str):
                         if param is not None:
                             weight_loader = getattr(param, "weight_loader")
                             weight_loader(param, loaded_weight, shard_id)
+                        else:
+                            unmatched_keys.append(weight_name)
                         found_packed = True
                         break
                 
@@ -176,6 +180,16 @@ def load_model(model: nn.Module, path: str):
                             param, "weight_loader", default_weight_loader 
                         )
                         weight_loader(param, loaded_weight)
+                    else:
+                        unmatched_keys.append(weight_name)
+
+    if unmatched_keys:
+        preview = ", ".join(unmatched_keys[:8])
+        suffix = " ..." if len(unmatched_keys) > 8 else ""
+        warnings.warn(
+            f"{len(unmatched_keys)} unmatched checkpoint keys while loading {path}: {preview}{suffix}",
+            stacklevel=2,
+        )
 
 
 def print_model(path: str):

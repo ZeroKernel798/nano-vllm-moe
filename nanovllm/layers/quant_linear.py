@@ -113,12 +113,16 @@ class AWQMergedColumnParallelLinear(AWQLinearBase):
 class AWQQKVParallelLinear(AWQLinearBase):
     def __init__(self, hidden_size, head_size, total_num_heads, total_num_kv_heads, bias=False, tp_group=None, **kwargs):
         self.head_size = head_size
-        tp_size = dist.get_world_size() if dist.is_initialized() else 1
+        tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
         self.num_heads = total_num_heads // tp_size
         self.num_kv_heads = total_num_kv_heads // tp_size
         output_size = (self.num_heads + 2 * self.num_kv_heads) * head_size
         super().__init__(hidden_size, output_size, tp_dim=1, tp_group=tp_group, **kwargs)
-        self._init_quant_blocks = self._init_quant_buffers(hidden_size, output_size)
+        self._init_quant_buffers(hidden_size, output_size)
+        if bias:
+            self.bias = nn.Parameter(torch.empty(output_size))
+        else:
+            self.register_parameter("bias", None)
 
     def _shard_loader(self, param, loaded_weight, shard_id, is_packed):
         if shard_id == "q":
@@ -138,4 +142,7 @@ class AWQQKVParallelLinear(AWQLinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = unpack_awq_int4(self.qweight, self.qzeros, self.scales, self.group_size)
-        return F.linear(x, w.to(x.dtype))
+        out = F.linear(x, w.to(x.dtype))
+        if self.bias is not None:
+            out = out + self.bias
+        return out
