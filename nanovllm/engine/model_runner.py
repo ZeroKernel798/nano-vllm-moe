@@ -52,7 +52,9 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        model_cls = model_dict[hf_config.model_type]
+        quant_type = getattr(hf_config, "quantization_type", None)
+        model_key = f"{hf_config.model_type}_{quant_type}" if quant_type else hf_config.model_type
+        model_cls = model_dict[model_key]
         model_init_params = inspect.signature(model_cls.__init__).parameters
         model_kwargs = {}
         if "tp_group" in model_init_params:

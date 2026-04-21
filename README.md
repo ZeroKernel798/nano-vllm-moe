@@ -12,7 +12,7 @@
 * Benchmarking Suite — 完善的性能评测套件，提供 TTFT、TPOT 等详细指标输出
 * Preserved Optimizations — 完整保留了原项目的 Prefix caching, Torch compilation 以及 CUDA graph 等生产级优化
 * MoE-Aware CUDA Graph — 计划绕过动态路由的同步限制，实现 MoE 全路径的 CUDA Graph 录制
-* Quantization — 计划支持 FP8 与 INT4 量化，用于缓解 Decode 阶段的带宽瓶颈，进一步推高生成吞吐
+* Quantization — 支持 FP8 W8A16 / W8A8 static 与 INT8 W8A16 / W8A8 static 量化，显著缓解 Decode 阶段的带宽瓶颈，进一步推高生成吞吐
 
 ## 安装
 
@@ -106,6 +106,61 @@ python scripts/tools/downmodel.py --model-id qwen/Qwen1.5-MoE-A2.7B-Chat --cache
 > **Bottleneck analysis**: <small>
 经过对 Qwen-1.5-MoE-2.7B 的深度压测，我们发现多卡并行（TP/EP）在 decode 阶段表现不佳，这并非框架缺陷，而是由以下两个核心技术瓶颈决定的：
 1、计算密度不足。对于 2.7B 这样的小规模模型，Decode 阶段单次算子的执行时间（us级）已经接近甚至小于 NVLink 的同步延迟。在 TP 或 EP 模式下，多卡之间频繁的 all-reduce 或 all-to-all 通信开销完全盖过了并行带来的计算收益。在这种级别的计算任务面前，“力大砖飞”的分布式策略反而成了性能累赘。2、MoE 动态特性对 CUDA Graph 的局限。目前的 MoE 实现采用了动态的 Token 分发逻辑，这需要 CPU 实时介入来决定下一阶段的计算规模。这种数据依赖的动态调度与 CUDA Graph 要求的“全静态计算图”存在天然冲突，导致目前无法通过录制 Graph 来消除 Python 调度和 Kernel Launch 的 Overhead。这也是 BS=1 时 TPOT 难以进一步下探的技术原因。后续将考虑引入量化以及 MoE 逻辑重构，利用 CUDA Graph 进一步优化，全部测试结果见docs/pd_separate_report.md</small>
+
+## INT8 量化支持（Qwen1.5-0.5B，RTX 3080）
+
+### 量化方案
+
+| 方案 | 权重精度 | 激活精度 | 校准要求 | 适用卡型 |
+|------|---------|---------|---------|---------|
+| `int8_w8a16` | INT8 | BF16 | 无 | 全部 |
+| `int8_w8a8_static` | INT8 | INT8（静态 scale）| 需校准 | Ampere+（CC≥8.0） |
+
+**关键设计**
+
+- **W8A16（权重量化）**：权重 int8 存储，推理时 dequant 至 BF16 做标准矩阵乘，无硬件约束，开箱即用。
+- **W8A8 static（静态激活量化）**：通过 `scripts/quantize/quantize.py` 离线标定每层 `input_scale`，运行时用固定 scalar 量化激活（比动态 per-token abs-max 少一轮全局 reduce）；大 batch（M > 32）走 `torch._int_mm` cuBLAS INT8 GEMM，小 batch（decode）自动回退至 BF16 保证速度。
+
+### 快速使用
+
+```bash
+# 1. 生成 INT8 W8A16 checkpoint（无需校准）
+python scripts/quantize/quantize.py \
+    --model-path /path/to/Qwen1.5-0.5B-Chat \
+    --output-path /path/to/Qwen1.5-0.5B-Chat-INT8 \
+    --scheme int8_w8a16
+
+# 2. 生成 INT8 W8A8 static checkpoint（带激活校准）
+python scripts/quantize/quantize.py \
+    --model-path /path/to/Qwen1.5-0.5B-Chat \
+    --output-path /path/to/Qwen1.5-0.5B-Chat-INT8-Static \
+    --scheme int8_w8a8_static \
+    --calib-samples 64 --calib-seqlen 512
+
+# 3. 推理（model_type 由 config.json 中 quantization_type 字段自动路由）
+python scripts/examples/example_quant.py --scheme int8_w8a8
+python scripts/examples/example_quant.py --scheme int8_w8a8_static
+
+# 4. 单元测试
+python -m pytest tests/quant/test_int8_linear.py -v
+
+# 5. WikiText-2 困惑度评估（需要网络或本地数据集）
+python scripts/eval/eval_ppl_nano_int8.py \
+    --model-path /path/to/Qwen1.5-0.5B-Chat-INT8 \
+    --max-length 2048 --stride 512
+```
+
+### 性能数据（RTX 3080，Qwen1.5-0.5B-Chat，`enforce_eager=True`）
+
+| 方案 | Decode TPS | 相对 BF16 | 显存（权重） |
+|------|-----------|---------|------------|
+| BF16 baseline | ~104 tok/s | 1.00x | ~1.0GB |
+| INT8 W8A16 | ~87 tok/s | 0.84x | ~0.5GB（−50%） |
+| INT8 W8A8 static | ~87 tok/s | 0.84x | ~0.5GB（−50%） |
+
+> **说明**：RTX 3080 decode 阶段 batch=1，INT8 GEMM 相比 BF16 无明显 compute 收益；主要价值在于**显存减半**，可在相同 GPU 上容纳更大模型或更长上下文。Ampere A100 / H100 上 W8A8 的 INT8 Tensor Core 加速会更显著。
+
+---
 
 ## Llama 3.1 8B 量化与基线对比（RTX 4090，单卡）
 

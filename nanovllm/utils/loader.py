@@ -76,8 +76,7 @@ def load_model(model: nn.Module, path: str):
                             else:
                                 unmatched_keys.append(weight_name)
                         
-                        print(f"Loaded {weight_name} into {param_name}[{expert_id}]")
-                        continue 
+                        continue
 
                 # --- 【核心新增逻辑：分离基础名称和量化后缀】 ---
                 # 例如：将 'model.layers.0.self_attn.q_proj.qweight' 

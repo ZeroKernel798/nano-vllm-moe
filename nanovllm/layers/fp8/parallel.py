@@ -86,8 +86,22 @@ class FP8LinearBase(nn.Module):
         x_2d = x.view(-1, x.shape[-1])
         if x_2d.dtype != torch.bfloat16:
             x_2d = x_2d.to(torch.bfloat16)
-        w_fp8 = self.qweight.view(torch.float8_e4m3fn)
-        out = launch_w8a16_gemm(x_2d, w_fp8, self.weight_scale, getattr(self, "bias", None))
+        w_fp8 = self.qweight.view(torch.float8_e4m3fn)  # [K, N]
+        bias = getattr(self, "bias", None)
+
+        # fp8e4nv matmul kernels require Hopper (CC≥9.0).  On older GPUs
+        # (Ampere, Ada, etc.) dequantize to BF16 and fall back to a standard
+        # BF16 matmul.  Memory savings still apply; compute efficiency is lower.
+        cc = torch.cuda.get_device_capability(x.device.index if x.device.index is not None else 0)
+        if cc[0] >= 9:
+            out = launch_w8a16_gemm(x_2d, w_fp8, self.weight_scale, bias)
+        else:
+            # Dequantize: w_fp8 [K, N] → bf16 [K, N], scale [N]
+            w_bf16 = w_fp8.to(torch.bfloat16) * self.weight_scale.to(torch.bfloat16).unsqueeze(0)
+            out = torch.mm(x_2d, w_bf16)
+            if bias is not None:
+                out = out + bias
+
         return out.view(*x.shape[:-1], -1).to(target_dtype)
 
     def _forward_w8a8_static(self, x: torch.Tensor) -> torch.Tensor:
@@ -166,7 +180,11 @@ class FP8QKVParallelLinear(FP8LinearBase):
         **kwargs,
     ) -> None:
         self.head_size = head_size
-        tp_size = dist.get_world_size() if dist.is_initialized() else 1
+        tp_size = (
+            dist.get_world_size(tp_group)
+            if tp_group is not None
+            else (dist.get_world_size() if dist.is_initialized() else 1)
+        )
         self.num_heads = total_num_heads // tp_size
         self.num_kv_heads = total_num_kv_heads // tp_size
         out_f = (self.num_heads + 2 * self.num_kv_heads) * head_size
@@ -178,23 +196,32 @@ class FP8QKVParallelLinear(FP8LinearBase):
         if fp8_scheme == "w8a8_static":
             self.input_scale.weight_loader = self.input_scale_loader
 
-    def qweight_loader(self, param, loaded_weight, shard_id):
-        if shard_id == "q":
-            size, offset = self.num_heads * self.head_size, 0
-        elif shard_id == "k":
-            size, offset = self.num_kv_heads * self.head_size, self.num_heads * self.head_size
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_f))
+            self.bias.weight_loader = self.bias_loader
         else:
-            size, offset = self.num_kv_heads * self.head_size, (self.num_heads + self.num_kv_heads) * self.head_size
+            self.register_parameter("bias", None)
+
+    def _qkv_slice(self, shard_id):
+        if shard_id == "q":
+            return self.num_heads * self.head_size, 0
+        elif shard_id == "k":
+            return self.num_kv_heads * self.head_size, self.num_heads * self.head_size
+        else:
+            return (self.num_kv_heads * self.head_size,
+                    (self.num_heads + self.num_kv_heads) * self.head_size)
+
+    def qweight_loader(self, param, loaded_weight, shard_id):
+        size, offset = self._qkv_slice(shard_id)
         param.data.narrow(1, offset, size).copy_(loaded_weight.t().contiguous())
 
     def weight_scale_loader(self, param, loaded_weight, shard_id):
-        if shard_id == "q":
-            size, offset = self.num_heads * self.head_size, 0
-        elif shard_id == "k":
-            size, offset = self.num_kv_heads * self.head_size, self.num_heads * self.head_size
-        else:
-            size, offset = self.num_kv_heads * self.head_size, (self.num_heads + self.num_kv_heads) * self.head_size
+        size, offset = self._qkv_slice(shard_id)
         _load_weight_scale(param, loaded_weight, offset, size)
+
+    def bias_loader(self, param, loaded_weight, shard_id):
+        size, offset = self._qkv_slice(shard_id)
+        param.data.narrow(0, offset, size).copy_(loaded_weight.view(-1))
 
     def input_scale_loader(self, param, loaded_weight, shard_id):
         flat = loaded_weight.view(-1)
@@ -204,7 +231,10 @@ class FP8QKVParallelLinear(FP8LinearBase):
             param.data.copy_(flat[:1])
 
     def forward(self, x):  # noqa: D102
-        return self.forward_fp8(x)
+        out = self.forward_fp8(x)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
 
 
 class FP8RowParallelLinear(FP8LinearBase):

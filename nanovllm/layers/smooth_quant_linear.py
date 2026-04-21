@@ -1,182 +1,301 @@
+"""INT8 quantized parallel linear layers.
+
+Two inference schemes share the same checkpoint format:
+
+W8A16 (weight-only)
+  - Weights stored as int8 with per-output-channel float32 scale.
+  - Activations remain in bfloat16.
+  - Compute: dequant weight → BF16 → standard cuBLAS GEMM.
+  - No calibration required.
+
+W8A8 static
+  - Weights: same as W8A16.
+  - Activations: quantized with a pre-computed per-layer scalar ``input_scale``
+    (calibrated offline; eliminates per-token abs-max overhead).
+  - Compute: for large batch (M > 32) → cuBLAS INT8 GEMM (``torch._int_mm``
+    with M-padding to next multiple of 32, required by RTX 3080/GA102);
+    for small batch (M ≤ 32) → BF16 fallback (padding cost exceeds benefit).
+  - Requires calibration step in ``scripts/quantize/quantize.py``.
+
+Checkpoint suffix naming (aligned with FP8 layers):
+  ``qweight``      [N, K] int8    (saved) / [K, N] int8 (in-memory, K-major)
+  ``weight_scale`` [N]    float32
+  ``input_scale``  [1]    float32  (W8A8 static only)
+"""
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 import torch.distributed as dist
-import triton
-import triton.language as tl
-from typing import Optional
 
-def divide(numerator, denominator):
-    assert numerator % denominator == 0
-    return numerator // denominator
 
-# ==============================================================================
-# 1. 工业级 INT8 W8A8 融合内核 (加入 Autotune 防止 SM 饥饿)
-# ==============================================================================
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 256}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128}, num_stages=4, num_warps=8),
-    ],
-    key=['M', 'N', 'K'],
-)
-@triton.jit
-def _w8a8_linear_kernel(
-    a_ptr, b_ptr, c_ptr, x_scales_ptr, w_scales_ptr, bias_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+# ---------------------------------------------------------------------------
+# INT8 GEMM helpers
+# ---------------------------------------------------------------------------
 
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+# RTX 3080 (GA102) cuBLAS INT8 constraint: M must be a multiple of 32 and > 16.
+_INT8_MM_MIN_M = 32
 
-    w_scales = tl.load(w_scales_ptr + offs_bn)
 
-    # 累加器必须是 INT32
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        k_mask = (k * BLOCK_SIZE_K + offs_k) < K
-        a_int8 = tl.load(a_ptrs, mask=k_mask[None, :], other=0)
-        b_int8 = tl.load(b_ptrs, mask=k_mask[:, None], other=0)
-        
-        # 调用硬件底层的 DP4A 或 IMMA 整数乘加指令
-        accumulator += tl.dot(a_int8, b_int8, out_dtype=tl.int32)
-        
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+def _int8_mm_padded(x_int8: torch.Tensor, qweight: torch.Tensor) -> torch.Tensor:
+    """``torch._int_mm`` with M-padding to satisfy cuBLAS INT8 alignment.
 
-    x_scales = tl.load(x_scales_ptr + offs_am)[:, None]
-    
-    # 反量化：INT32 -> FP32 * scale * scale
-    c = accumulator.to(tl.float32) * x_scales * w_scales[None, :]
-    
-    if bias_ptr is not None:
-        c += tl.load(bias_ptr + offs_bn)[None, :]
+    Args:
+        x_int8:  [M, K] int8 — quantized activations
+        qweight: [K, N] int8 — quantized weight (K-major)
+    Returns:
+        [M, N] int32
+    """
+    M = x_int8.shape[0]
+    pad_m = (_INT8_MM_MIN_M - M % _INT8_MM_MIN_M) % _INT8_MM_MIN_M
+    if M <= 16:  # cuBLAS requires M > 16 as well
+        pad_m = _INT8_MM_MIN_M - M
+    if pad_m > 0:
+        x_int8 = F.pad(x_int8.float(), (0, 0, 0, pad_m)).to(torch.int8)
+    out = torch._int_mm(x_int8, qweight)
+    return out[:M]
 
-    # 存储回全局内存
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    tl.store(c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :], c.to(tl.bfloat16), 
-             mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
-# ==============================================================================
-# 2. 基础 INT8 量化层
-# ==============================================================================
+def _divide(n: int, d: int) -> int:
+    assert n % d == 0, f"{n} is not divisible by {d}"
+    return n // d
+
+
+# ---------------------------------------------------------------------------
+# Base class
+# ---------------------------------------------------------------------------
+
 class Int8LinearBase(nn.Module):
-    def __init__(self, input_size, output_size, tp_dim=None, tp_group=None, **kwargs):
+    """Common INT8 quantized linear base.
+
+    Parameters
+    ----------
+    int8_scheme : ``"w8a16"`` or ``"w8a8_static"``
+        Selects the inference path (see module docstring).
+
+    Buffers
+    -------
+    qweight      : [K, N] int8   — weight in K-major layout (transposed from HF)
+    weight_scale : [N]    float32 — per-output-channel dequant scale
+    input_scale  : [1]    float32 — activation scale  (``w8a8_static`` only)
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        int8_scheme: str = "w8a16",
+        tp_dim=None,
+        tp_group=None,
+        **_kwargs,
+    ):
         super().__init__()
+        assert int8_scheme in ("w8a16", "w8a8_static"), \
+            f"Unknown int8_scheme: {int8_scheme!r}"
         self.input_size = input_size
         self.output_size = output_size
-        self.tp_size = dist.get_world_size(tp_group) if tp_group else (dist.get_world_size() if dist.is_initialized() else 1)
-
-    def _init_quant_buffers(self, in_features, out_features):
-        self.register_buffer("qweight_kn", torch.zeros((in_features, out_features), dtype=torch.int8))
-        self.register_buffer("weight_scales", torch.zeros((out_features,), dtype=torch.float16))
-
-    def forward_w8a8(self, x: torch.Tensor) -> torch.Tensor:
-        target_dtype = x.dtype
-        x_2d = x.view(-1, x.shape[-1])
-        
-        # 极速动态激活量化
-        x_max = torch.amax(x_2d.abs(), dim=-1, keepdim=True).to(torch.float32) + 1e-5
-        x_scales = x_max / 127.0
-        x_int8 = torch.clamp(torch.round(x_2d / x_scales), -128, 127).to(torch.int8)
-        
-        M, K = x_int8.shape
-        N = self.qweight_kn.shape[1]
-        output = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
-        
-        grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
-        _w8a8_linear_kernel[grid](
-            x_int8, self.qweight_kn, output, x_scales.to(torch.float32), self.weight_scales.to(torch.float32), getattr(self, "bias", None),
-            M, N, K,
-            x_int8.stride(0), x_int8.stride(1),
-            self.qweight_kn.stride(0), self.qweight_kn.stride(1),
-            output.stride(0), output.stride(1),
-            GROUP_SIZE_M=8
+        self.int8_scheme = int8_scheme
+        self.tp_group = tp_group
+        self.tp_size = (
+            dist.get_world_size(tp_group) if tp_group is not None
+            else (dist.get_world_size() if dist.is_initialized() else 1)
         )
-        return output.view(*x.shape[:-1], -1).to(target_dtype)
+        self.tp_rank = (
+            dist.get_rank(tp_group) if tp_group is not None
+            else (dist.get_rank() if dist.is_initialized() else 0)
+        )
 
-# ==============================================================================
-# 3. 算子并行类
-# ==============================================================================
+    def _init_quant_buffers(self, in_features: int, out_features: int):
+        self.register_buffer("qweight", torch.zeros((in_features, out_features), dtype=torch.int8))
+        self.register_buffer("weight_scale", torch.zeros((out_features,), dtype=torch.float32))
+        if self.int8_scheme == "w8a8_static":
+            self.register_buffer("input_scale", torch.ones(1, dtype=torch.float32))
+
+    # ------------------------------------------------------------------
+    # W8A16: dequant weight → BF16 → cuBLAS GEMM
+    # ------------------------------------------------------------------
+    def _forward_w8a16(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x_2d = x.view(-1, x.shape[-1]).to(torch.bfloat16)
+        # qweight [K,N] → F.linear expects [N,K]: use .t()
+        w = self.qweight.to(torch.bfloat16).t()               # [N, K]
+        w = w * self.weight_scale.to(torch.bfloat16).unsqueeze(1)
+        bias = getattr(self, "bias", None)
+        out = F.linear(x_2d, w,
+                       bias.to(torch.bfloat16) if bias is not None else None)
+        return out.to(orig_dtype).view(*x.shape[:-1], -1)
+
+    # ------------------------------------------------------------------
+    # W8A8 static: calibrated input_scale, INT8 GEMM for large M
+    # ------------------------------------------------------------------
+    def _forward_w8a8_static(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x_2d = x.view(-1, x.shape[-1])
+        M = x_2d.shape[0]
+
+        # Quantize activation with pre-computed scale (single scalar divide)
+        x_int8 = x_2d.float().div(self.input_scale).clamp(-128, 127).round().to(torch.int8)
+
+        if M > _INT8_MM_MIN_M:
+            # cuBLAS INT8 GEMM path (DP4A Tensor Cores)
+            out_i32 = _int8_mm_padded(x_int8, self.qweight)   # [M, N] int32
+            out = out_i32.float() * self.input_scale * self.weight_scale.unsqueeze(0)
+        else:
+            # BF16 fallback: avoid padding overhead for small batch (decode)
+            w = self.qweight.to(torch.bfloat16).t()
+            w = w * self.weight_scale.to(torch.bfloat16).unsqueeze(1)
+            out = F.linear(x_2d.to(torch.bfloat16), w).float()
+
+        bias = getattr(self, "bias", None)
+        if bias is not None:
+            out = out + bias.float()
+        return out.to(orig_dtype).view(*x.shape[:-1], -1)
+
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.int8_scheme == "w8a8_static":
+            return self._forward_w8a8_static(x)
+        return self._forward_w8a16(x)
+
+
+# ---------------------------------------------------------------------------
+# Parallel variants
+# ---------------------------------------------------------------------------
+
 class Int8MergedColumnParallelLinear(Int8LinearBase):
-    def __init__(self, input_size, output_sizes, bias=False, tp_group=None, **kwargs):
-        self.output_sizes = output_sizes
-        super().__init__(input_size, sum(output_sizes), tp_dim=1, tp_group=tp_group, **kwargs)
-        self._init_quant_buffers(input_size, sum(output_sizes) // self.tp_size)
-        self.bias = nn.Parameter(torch.empty(sum(output_sizes) // self.tp_size)) if bias else None
-        self.qweight_kn.weight_loader = self.qweight_loader
-        self.weight_scales.weight_loader = self.weight_scales_loader
+    """Gate+up fused MLP projection (INT8)."""
 
-    def qweight_loader(self, param, loaded_weight, shard_id):
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        bias: bool = False,
+        int8_scheme: str = "w8a16",
+        tp_group=None,
+        **kwargs,
+    ):
+        self.output_sizes = output_sizes
+        super().__init__(input_size, sum(output_sizes), int8_scheme, tp_dim=1,
+                         tp_group=tp_group, **kwargs)
+        self._init_quant_buffers(input_size, sum(output_sizes) // self.tp_size)
+
+        self.qweight.weight_loader = self._qweight_loader
+        self.weight_scale.weight_loader = self._scale_loader
+        if int8_scheme == "w8a8_static":
+            self.input_scale.weight_loader = self._input_scale_loader
+
+        self.bias = nn.Parameter(torch.empty(sum(output_sizes) // self.tp_size)) if bias else None
+
+    def _qweight_loader(self, param, loaded_weight, shard_id: int):
         offset = sum(self.output_sizes[:shard_id]) // self.tp_size
         size = self.output_sizes[shard_id] // self.tp_size
+        # loaded: [N_shard, K] → transpose to [K, N_shard] (K-major)
         param.data.narrow(1, offset, size).copy_(loaded_weight.t().contiguous())
 
-    def weight_scales_loader(self, param, loaded_weight, shard_id):
+    def _scale_loader(self, param, loaded_weight, shard_id: int):
         offset = sum(self.output_sizes[:shard_id]) // self.tp_size
         size = self.output_sizes[shard_id] // self.tp_size
-        param.data.narrow(0, offset, size).copy_(loaded_weight.view(-1))
+        param.data.narrow(0, offset, size).copy_(loaded_weight.view(-1).to(torch.float32))
 
-    def forward(self, x): return self.forward_w8a8(x)
+    def _input_scale_loader(self, param, loaded_weight, shard_id):
+        flat = loaded_weight.view(-1)
+        param.data.copy_(flat[:1])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward(x)
+
 
 class Int8QKVParallelLinear(Int8LinearBase):
-    def __init__(self, hidden_size, head_size, total_num_heads, total_num_kv_heads, bias=False, tp_group=None, **kwargs):
+    """QKV fused attention projection (INT8)."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: int,
+        bias: bool = False,
+        int8_scheme: str = "w8a16",
+        tp_group=None,
+        **kwargs,
+    ):
         self.head_size = head_size
-        tp_size = dist.get_world_size() if dist.is_initialized() else 1
+        tp_size = (
+            dist.get_world_size(tp_group) if tp_group is not None
+            else (dist.get_world_size() if dist.is_initialized() else 1)
+        )
         self.num_heads = total_num_heads // tp_size
         self.num_kv_heads = total_num_kv_heads // tp_size
         out_f = (self.num_heads + 2 * self.num_kv_heads) * head_size
-        super().__init__(hidden_size, out_f, tp_dim=1, tp_group=tp_group, **kwargs)
+        super().__init__(hidden_size, out_f, int8_scheme, tp_dim=1, tp_group=tp_group, **kwargs)
         self._init_quant_buffers(hidden_size, out_f)
-        self.qweight_kn.weight_loader = self.qweight_loader
-        self.weight_scales.weight_loader = self.weight_scales_loader
 
-    def qweight_loader(self, param, loaded_weight, shard_id):
-        if shard_id == "q": size, offset = self.num_heads * self.head_size, 0
-        elif shard_id == "k": size, offset = self.num_kv_heads * self.head_size, self.num_heads * self.head_size
-        else: size, offset = self.num_kv_heads * self.head_size, (self.num_heads + self.num_kv_heads) * self.head_size
+        self.qweight.weight_loader = self._qweight_loader
+        self.weight_scale.weight_loader = self._scale_loader
+        if int8_scheme == "w8a8_static":
+            self.input_scale.weight_loader = self._input_scale_loader
+
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_f))
+            self.bias.weight_loader = self._bias_loader
+        else:
+            self.register_parameter("bias", None)
+
+    def _qkv_slice(self, shard_id: str):
+        if shard_id == "q":
+            return self.num_heads * self.head_size, 0
+        elif shard_id == "k":
+            return self.num_kv_heads * self.head_size, self.num_heads * self.head_size
+        else:
+            return (self.num_kv_heads * self.head_size,
+                    (self.num_heads + self.num_kv_heads) * self.head_size)
+
+    def _qweight_loader(self, param, loaded_weight, shard_id):
+        size, offset = self._qkv_slice(shard_id)
         param.data.narrow(1, offset, size).copy_(loaded_weight.t().contiguous())
 
-    def weight_scales_loader(self, param, loaded_weight, shard_id):
-        if shard_id == "q": size, offset = self.num_heads * self.head_size, 0
-        elif shard_id == "k": size, offset = self.num_kv_heads * self.head_size, self.num_heads * self.head_size
-        else: size, offset = self.num_kv_heads * self.head_size, (self.num_heads + self.num_kv_heads) * self.head_size
+    def _scale_loader(self, param, loaded_weight, shard_id):
+        size, offset = self._qkv_slice(shard_id)
+        param.data.narrow(0, offset, size).copy_(loaded_weight.view(-1).to(torch.float32))
+
+    def _bias_loader(self, param, loaded_weight, shard_id):
+        size, offset = self._qkv_slice(shard_id)
         param.data.narrow(0, offset, size).copy_(loaded_weight.view(-1))
 
-    def forward(self, x): return self.forward_w8a8(x)
-
-class Int8RowParallelLinear(Int8LinearBase):
-    def __init__(self, input_size, output_size, bias=False, reduce_results=True, tp_group=None, **kwargs):
-        super().__init__(input_size, output_size, tp_dim=0, tp_group=tp_group, **kwargs)
-        self.reduce_results = reduce_results
-        self._init_quant_buffers(divide(input_size, self.tp_size), output_size)
-        self.bias = nn.Parameter(torch.empty(output_size)) if bias else None
-        self.qweight_kn.weight_loader = lambda p, w, *args: p.data.copy_(w.t().contiguous())
-        self.weight_scales.weight_loader = lambda p, w, *args: p.data.copy_(w.view(-1))
+    def _input_scale_loader(self, param, loaded_weight, shard_id):
+        flat = loaded_weight.view(-1)
+        param.data.copy_(flat[:1])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.forward_w8a8(x)
+        return self._forward(x)
+
+
+class Int8RowParallelLinear(Int8LinearBase):
+    """Output projection (INT8, all-reduce for TP > 1)."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = False,
+        reduce_results: bool = True,
+        int8_scheme: str = "w8a16",
+        tp_group=None,
+        **kwargs,
+    ):
+        super().__init__(input_size, output_size, int8_scheme, tp_dim=0, tp_group=tp_group, **kwargs)
+        self.reduce_results = reduce_results
+        self._init_quant_buffers(_divide(input_size, self.tp_size), output_size)
+
+        self.qweight.weight_loader = lambda p, w, *_: p.data.copy_(w.t().contiguous())
+        self.weight_scale.weight_loader = lambda p, w, *_: p.data.copy_(w.view(-1).to(torch.float32))
+        if int8_scheme == "w8a8_static":
+            self.input_scale.weight_loader = lambda p, w, *_: p.data.copy_(w.view(-1)[:1])
+
+        self.bias = nn.Parameter(torch.empty(output_size)) if bias else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self._forward(x)
         if self.tp_size > 1 and self.reduce_results:
             dist.all_reduce(out, group=self.tp_group)
-        return out + self.bias if self.bias is not None else out
+        return out

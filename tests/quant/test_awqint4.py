@@ -1,3 +1,7 @@
+import pytest
+
+pytest.importorskip("awq", reason="AutoAWQ package not installed; skipping integration test")
+
 from awq import AutoAWQForCausalLM
 from transformers import AutoTokenizer, TextStreamer
 import torch
