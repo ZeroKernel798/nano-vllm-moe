@@ -6,7 +6,7 @@ Use cases
 - **BF16 / FP16 baseline**: point ``--model-path`` at a standard HF checkpoint
   (``torch_dtype`` matches weights).
 
-- **nano-vllm FP8 exports** (``qweight`` / ``weight_scale``): use ``eval_ppl_nano_fp8.py`` in this
+- **nano-vllm FP8 exports** (``qweight`` / ``weight_scale``): use ``scripts/eval/eval_ppl_nano_fp8.py`` in this
   repo (dequantizes weights to BF16, then same WikiText loop). See that script for W8A8 vs W8A16
   interpretation.
 
@@ -24,7 +24,7 @@ Example
 -------
 ::
 
-    python eval_ppl_wikitext.py --model-path /path/to/Llama-3.1-8B-Instruct \\
+    python scripts/eval/eval_ppl_wikitext.py --model-path /path/to/Llama-3.1-8B-Instruct \\
         --dtype bfloat16 --max-length 2048 --stride 512
 
 """

@@ -26,12 +26,12 @@ pip install -e .
 
 推荐使用内置的下载脚本从 ModelScope 极速获取模型
 
-python download_model.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
+python scripts/tools/downmodel.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
 
 
 ## Benchmark
 
-使用 ep_bench.py 模拟生产环境下随机输入序列，测试Group-Gemm相关实现的性能
+使用 `scripts/benchmarks/ep_bench.py` 模拟生产环境下随机输入序列，测试Group-Gemm相关实现的性能
 
 **测试配置**
 - Hardware: NVIDIA A100-SXM4-80GB (HBM2e / NVLink)
@@ -50,7 +50,7 @@ python download_model.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
 
 
 
-可使用 ep_tp_bench.py 模拟生产环境下随机输入序列多卡推理测试，横向对比各种并行策略，一键生成测试结果
+可使用 `scripts/benchmarks/ep_tp_bench.py` 模拟生产环境下随机输入序列多卡推理测试，横向对比各种并行策略，一键生成测试结果
 
 **测试配置**
 - Hardware: NVIDIA A100-SXM4-80GB (HBM2e / NVLink)
@@ -70,7 +70,7 @@ python download_model.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
 |TP=4, EP=1|   4   |      2430.07       |     4999.32        |
 
 
-可使用 pd_bench.py 输入给定长度和批次的序列，分析 prefill 和 decode 阶段，不同分布式策略的性能
+可使用 `scripts/benchmarks/pd_bench.py` 输入给定长度和批次的序列，分析 prefill 和 decode 阶段，不同分布式策略的性能
 
 **测试配置**
 - Hardware: NVIDIA A100-SXM4-80GB (HBM2e / NVLink)
@@ -109,9 +109,9 @@ python download_model.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
 
 ## Llama 3.1 8B 量化与基线对比（RTX 4090，单卡）
 
-以下数据来自本仓库中的 `bench.py`、`pd_bench.py` 与 WikiText 困惑度脚本，详细原始表格见 `docs/fp8_bf16_bench.md`、`docs/pd_separate_report_bf16.md`、`docs/pd_separate_report_fp8_w8a8.md`、`docs/pd_separate_report_fp8_w8a16.md` 与 `docs/wikitext.md`。硬件为 **NVIDIA GeForce RTX 4090**，模型为 **Meta Llama 3.1 8B** 系列；P/D 测试为 **TP=1, EP=1**。
+以下数据来自本仓库中的 `scripts/benchmarks/bench.py`、`scripts/benchmarks/pd_bench.py` 与 WikiText 困惑度脚本，详细原始表格见 `docs/fp8_bf16_bench.md`、`docs/pd_separate_report_bf16.md`、`docs/pd_separate_report_fp8_w8a8.md`、`docs/pd_separate_report_fp8_w8a16.md` 与 `docs/wikitext.md`。硬件为 **NVIDIA GeForce RTX 4090**，模型为 **Meta Llama 3.1 8B** 系列；P/D 测试为 **TP=1, EP=1**。
 
-### 端到端混合负载（bench.py）
+### 端到端混合负载（scripts/benchmarks/bench.py）
 
 **测试配置（与 `docs/fp8_bf16_bench.md` 一致）**
 
@@ -132,7 +132,7 @@ python download_model.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
 
 *分析要点：* 在相同随机负载与总生成 token 数下，**W8A8** 总墙钟时间最短，prefill / decode 吞吐均高于 BF16，说明静态 FP8 激活 + FP8 权重路径在本机与 cuBLASLt 组合下对混合负载更友好。**W8A16** 的 prefill_tps 明显偏低而 decode_tps 高于 BF16，与「prefill 偏算力、W8A16 Triton 路径与 BF16 主路径效率差异；decode 偏权重带宽、FP8 权重量更省」的典型现象一致。
 
-### Prefill / Decode 阶段分离（pd_bench.py）
+### Prefill / Decode 阶段分离（scripts/benchmarks/pd_bench.py）
 
 **测试配置**
 
@@ -152,7 +152,7 @@ python download_model.py --model qwen/Qwen1.5-MoE-A2.7B-Chat --path ./my_models
 
 *分析要点：* **Prefill** 上 BF16 在多数配置下略逊于或接近 W8A8，W8A16 普遍低于 BF16（大块 GEMM 上 BF16 Tensor Core 主路径仍很成熟）。**Decode** 上 W8A8 在中高 batch 下相对 BF16 提升明显（权重更省带宽）；W8A16 在 BS=1 略优，在 BS=256 时低于 BF16，与实现路径和 batch 形态有关。完整矩阵见上述 `docs/pd_separate_report_*.md`。
 
-### WikiText-2 困惑度（eval_ppl_wikitext.py / eval_ppl_nano_fp8.py）
+### WikiText-2 困惑度（scripts/eval/eval_ppl_wikitext.py / scripts/eval/eval_ppl_nano_fp8.py）
 
 **测试配置**
 

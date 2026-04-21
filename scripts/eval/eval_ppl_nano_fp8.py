@@ -2,7 +2,7 @@
 WikiText-2 perplexity for **nano-vllm FP8 exports** (W8A8 / W8A16) by dequantizing weights to BF16.
 
 Loads ``*.safetensors`` with ``qweight`` + ``weight_scale``, reconstructs ``Linear.weight`` in FP32
-then casts to BF16, and runs the same sliding-window loss as ``eval_ppl_wikitext.py``.
+then casts to BF16, and runs the same sliding-window loss as ``scripts/eval/eval_ppl_wikitext.py``.
 
 Interpretation
 --------------
@@ -16,7 +16,7 @@ Interpretation
 
 Example::
 
-    python eval_ppl_nano_fp8.py --model-path /root/autodl-tmp/models/Meta-Llama-3.1-8B-FP8-Static --max-length 2048   --stride 512   --split test
+    python scripts/eval/eval_ppl_nano_fp8.py --model-path /root/autodl-tmp/models/Meta-Llama-3.1-8B-FP8-Static --max-length 2048   --stride 512   --split test
 """
 
 from __future__ import annotations

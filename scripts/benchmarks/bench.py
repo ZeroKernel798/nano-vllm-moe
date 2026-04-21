@@ -2,14 +2,14 @@
 End-to-end generation benchmark (mixed prefill + decode).
 
 Compare BF16 vs FP8 checkpoints by running this script with different ``--model-path``
-(same hyperparameters). For P/D isolation use ``pd_bench.py`` instead.
+(same hyperparameters). For P/D isolation use ``scripts/benchmarks/pd_bench.py`` instead.
 
 Examples::
 
-    python bench.py --model-path /path/to/bf16-instruct --label bf16
-    python bench.py --model-path /path/to/fp8-w8a8 --label w8a8
-    python bench.py --model-path /path/to/fp8-w8a16 --label w8a16
-    python bench.py --model-path /root/autodl-tmp/models/LLM-Research/Meta-Llama-3.1-8B-Instruct --label bf16 --warmup \
+    python scripts/benchmarks/bench.py --model-path /path/to/bf16-instruct --label bf16
+    python scripts/benchmarks/bench.py --model-path /path/to/fp8-w8a8 --label w8a8
+    python scripts/benchmarks/bench.py --model-path /path/to/fp8-w8a16 --label w8a16
+    python scripts/benchmarks/bench.py --model-path /root/autodl-tmp/models/LLM-Research/Meta-Llama-3.1-8B-Instruct --label bf16 --warmup \
     --num-seqs 256 \
     --input-len 1024 \
     --output-len 1024 \
