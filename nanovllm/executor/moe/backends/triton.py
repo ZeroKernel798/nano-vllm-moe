@@ -30,7 +30,7 @@ class TritonMoEBackend(MoEBackend):
         top_k: int,
     ) -> dict[str, torch.Tensor | list[int] | int]:
         if self.ep_size <= 1:
-            recv_x = x.repeat_interleave(top_k, dim=0)
+            recv_x = x if top_k == 1 else x.repeat_interleave(top_k, dim=0)
             recv_local_ids = topk_ids.flatten()
             recv_weights = topk_weights.flatten()
             num_recv = recv_x.shape[0]
@@ -84,12 +84,25 @@ class TritonMoEBackend(MoEBackend):
         recv_weights: torch.Tensor,
         w13_stacked: torch.Tensor,
         w2_stacked: torch.Tensor,
+        w13_weight_scale: torch.Tensor | None = None,
+        w2_weight_scale: torch.Tensor | None = None,
         local_num_experts: int,
         local_inter_size: int,
         hidden_size: int,
         model_dtype: torch.dtype,
     ) -> torch.Tensor:
         num_recv = recv_x.shape[0]
+        if w13_stacked.dtype == torch.uint8:
+            w13_stacked = w13_stacked.view(torch.float8_e4m3fn).to(model_dtype)
+            if w13_weight_scale is None:
+                raise ValueError("FP8 MoE w13_stacked requires w13_weight_scale")
+            w13_stacked = w13_stacked * w13_weight_scale.to(model_dtype).unsqueeze(-1)
+        if w2_stacked.dtype == torch.uint8:
+            w2_stacked = w2_stacked.view(torch.float8_e4m3fn).to(model_dtype)
+            if w2_weight_scale is None:
+                raise ValueError("FP8 MoE w2_stacked requires w2_weight_scale")
+            w2_stacked = w2_stacked * w2_weight_scale.to(model_dtype).unsqueeze(-1)
+
         block_size_m, group_size_m = 32, 8
         sorted_token_ids, sorted_weight_idx, expert_ids, num_blocks = moe_align_block_size(
             recv_local_ids.view(-1, 1), local_num_experts, block_size_m
@@ -160,6 +173,7 @@ class TritonMoEBackend(MoEBackend):
         permute_indices: torch.Tensor,
         s_list: list[int],
         r_list: list[int],
+        reduce_results: bool = True,
     ) -> torch.Tensor:
         if self.ep_size > 1:
             combined_x = torch.empty(m_tokens * top_k, hidden_size, device=local_out_fp32.device, dtype=model_dtype)
@@ -167,10 +181,13 @@ class TritonMoEBackend(MoEBackend):
         else:
             combined_x = local_out_fp32.to(model_dtype)
 
-        sparse_out_flat = torch.zeros((m_tokens * top_k, hidden_size), device=local_out_fp32.device, dtype=model_dtype)
-        sparse_out_flat[permute_indices] = combined_x
-        output = sparse_out_flat.view(m_tokens, top_k, hidden_size).sum(dim=1)
+        if self.ep_size <= 1:
+            output = combined_x.view(m_tokens, top_k, hidden_size).sum(dim=1)
+        else:
+            sparse_out_flat = torch.empty((m_tokens * top_k, hidden_size), device=local_out_fp32.device, dtype=model_dtype)
+            sparse_out_flat[permute_indices] = combined_x
+            output = sparse_out_flat.view(m_tokens, top_k, hidden_size).sum(dim=1)
 
-        if self.tp_size > 1:
+        if reduce_results and self.tp_size > 1:
             dist.all_reduce(output, group=self.tp_group)
         return output
