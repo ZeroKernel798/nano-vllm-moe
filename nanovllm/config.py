@@ -22,6 +22,7 @@ class Config:
     num_kvcache_blocks: int = -1
     #: Logical KV storage dtype: ``"bf16"`` (default) or ``"fp8_e4m3"`` (planned; see ``utils/kv_cache``).
     kv_cache_dtype: str = "bf16"
+    moe_backend: str = "fused"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

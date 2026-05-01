@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen2MoeConfig 
 
-from nanovllm.executor.moe.backends import TritonMoEBackend
+from nanovllm.executor.moe.blocks import BaseSparseMoeBlock
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -162,74 +162,35 @@ class Qwen2MoeEagerSparseMoeBlock(nn.Module):
         return (shared_output + sparse_hidden_states).view(orig_shape)
     
 
-class Qwen2MoeSparseMoeBlock(nn.Module):
+class Qwen2MoeSparseMoeBlock(BaseSparseMoeBlock):
     def __init__(
-        self, 
-        config, 
+        self,
+        config,
         tp_group: Optional[dist.ProcessGroup] = None,
         ep_group: Optional[dist.ProcessGroup] = None,
         use_overlap: bool = True,
+        experts_backend: str = "fused",
     ) -> None:
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.global_num_experts = config.num_experts
-        self.top_k = config.num_experts_per_tok
-        self.moe_intermediate_size = config.moe_intermediate_size
+        super().__init__(
+            config,
+            tp_group=tp_group,
+            ep_group=ep_group,
+            renormalize_router_weights=False,
+            experts_backend=experts_backend,
+        )
         self.use_overlap = use_overlap
-        
-        self.tp_group = tp_group
-        self.ep_group = ep_group
-        
-        self.tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
-        self.tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
-        self.ep_size = dist.get_world_size(ep_group) if ep_group is not None else 1
-        self.ep_rank = dist.get_rank(ep_group) if ep_group is not None else 0
-        self.backend = TritonMoEBackend(tp_group=tp_group, ep_group=ep_group)
-        
-        self.local_num_experts = self.global_num_experts // self.ep_size
-        self.local_inter_size = self.moe_intermediate_size // self.tp_size
-
-        self.w13_stacked = nn.Parameter(torch.zeros(
-            self.local_num_experts, 2 * self.local_inter_size, self.hidden_size
-        ))
-        self.w2_stacked = nn.Parameter(torch.zeros(
-            self.local_num_experts, self.hidden_size, self.local_inter_size
-        ))
-        self.w13_stacked.weight_loader = self.load_hybrid_moe_weight
-        self.w2_stacked.weight_loader = self.load_hybrid_moe_weight
-
-        self.gate = nn.Linear(self.hidden_size, self.global_num_experts, bias=False)
         self.shared_expert_gate = nn.Linear(self.hidden_size, 1, bias=False)
-        self.gate.weight.weight_loader = self.load_replicated_weight
         self.shared_expert_gate.weight.weight_loader = self.load_replicated_weight
-
         self.shared_expert = Qwen2MoeMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.shared_expert_intermediate_size,
             hidden_act=config.hidden_act,
             reduce_results=False,
-            tp_group=tp_group
+            tp_group=tp_group,
         )
-
-        self.shared_expert_stream = torch.cuda.Stream() if use_overlap else None
-
-    def load_replicated_weight(self, param, loaded_weight, **kwargs):
-        with torch.no_grad():
-            param.copy_(loaded_weight)
-
-    def load_hybrid_moe_weight(self, param, loaded_weight, global_expert_id, shard_id=None, **kwargs):
-        with torch.no_grad():
-            if not (self.ep_rank * self.local_num_experts <= global_expert_id < (self.ep_rank + 1) * self.local_num_experts):
-                return 
-            local_id = global_expert_id % self.local_num_experts
-            start = self.tp_rank * self.local_inter_size
-            size = self.local_inter_size
-            if shard_id in [0, "w1", "gate_proj"]: 
-                param.data[local_id].narrow(0, 0, size).copy_(loaded_weight.narrow(0, start, size))
-            elif shard_id in [1, "w3", "up_proj"]: 
-                param.data[local_id].narrow(0, size, size).copy_(loaded_weight.narrow(0, start, size))
-            elif shard_id in [None, "w2", "down_proj"]: 
-                param.data[local_id].copy_(loaded_weight.narrow(1, start, size))
+        self.shared_expert_stream = (
+            torch.cuda.Stream() if use_overlap and torch.cuda.is_available() else None
+        )
 
     def _compute_shared_expert(self, x):
         out = self.shared_expert(x)
@@ -239,61 +200,24 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         x = hidden_states.view(-1, self.hidden_size).contiguous()
-        M, H = x.shape
-        model_dtype = x.dtype
+        topk_weights, topk_ids = self.route(x)
 
-        if self.use_overlap:
+        if self.shared_expert_stream is not None:
             self.shared_expert_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.shared_expert_stream):
                 shared_out = self._compute_shared_expert(x)
         else:
             shared_out = self._compute_shared_expert(x)
 
-        router_logits = self.gate(x)
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
-        topk_weights, topk_ids = torch.topk(routing_weights, self.top_k, dim=-1)
+        sparse_out = self.apply_sparse_experts(x, topk_weights, topk_ids, reduce_tp=False)
 
-        dispatch_state = self.backend.dispatch(
-            x=x,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            local_num_experts=self.local_num_experts,
-            top_k=self.top_k,
-        )
-
-        local_out_fp32 = self.backend.compute(
-            recv_x=dispatch_state["recv_x"],
-            recv_local_ids=dispatch_state["recv_local_ids"],
-            recv_weights=dispatch_state["recv_weights"],
-            w13_stacked=self.w13_stacked,
-            w2_stacked=self.w2_stacked,
-            local_num_experts=self.local_num_experts,
-            local_inter_size=self.local_inter_size,
-            hidden_size=self.hidden_size,
-            model_dtype=model_dtype,
-        )
-
-        sparse_out = self.backend.combine(
-            local_out_fp32=local_out_fp32,
-            model_dtype=model_dtype,
-            m_tokens=M,
-            hidden_size=H,
-            top_k=self.top_k,
-            permute_indices=dispatch_state["permute_indices"],
-            s_list=dispatch_state["s_list"],
-            r_list=dispatch_state["r_list"],
-            reduce_results=False,
-        )
-
-        if self.use_overlap:
+        if self.shared_expert_stream is not None:
             torch.cuda.current_stream().wait_stream(self.shared_expert_stream)
-        
+
         output = shared_out + sparse_out
         if self.tp_size > 1:
             dist.all_reduce(output, group=self.tp_group)
-
         return output.view(orig_shape)
-
 
 class Qwen2MoeDecoderLayer(nn.Module):
     def __init__(
@@ -302,7 +226,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
         layer_idx: int,
         tp_group: Optional[dist.ProcessGroup] = None,
         ep_group: Optional[dist.ProcessGroup] = None,
-        group_gemm_enable : bool = True
+        group_gemm_enable : bool = True,
+        moe_backend: str = "fused",
     ) -> None:
         super().__init__()
         self.self_attn = Qwen2MoeAttention(
@@ -319,7 +244,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             if group_gemm_enable:
-                self.mlp = Qwen2MoeSparseMoeBlock(config=config, tp_group=tp_group, ep_group=ep_group)
+                self.mlp = Qwen2MoeSparseMoeBlock(
+                    config=config,
+                    tp_group=tp_group,
+                    ep_group=ep_group,
+                    experts_backend=moe_backend,
+                )
             else:
                 self.mlp = Qwen2MoeEagerSparseMoeBlock(config=config, tp_group=tp_group, ep_group=ep_group)
         else:
@@ -348,14 +278,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
 
 class Qwen2MoeModel(nn.Module):
-    def __init__(self, config: Qwen2MoeConfig, tp_group=None, ep_group=None) -> None:
+    def __init__(self, config: Qwen2MoeConfig, tp_group=None, ep_group=None, moe_backend: str = "fused") -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, tp_group=tp_group
         )
         self.layers = nn.ModuleList(
             [
-                Qwen2MoeDecoderLayer(config, layer_idx, tp_group, ep_group)
+                Qwen2MoeDecoderLayer(config, layer_idx, tp_group, ep_group, moe_backend=moe_backend)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -384,6 +314,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         config: Qwen2MoeConfig, 
         tp_group: Optional[dist.ProcessGroup] = None, 
         ep_group: Optional[dist.ProcessGroup] = None,
+        moe_backend: str = "fused",
         **kwargs 
     ) -> None:
         super().__init__()
@@ -392,7 +323,12 @@ class Qwen2MoeForCausalLM(nn.Module):
         self.ep_group = ep_group
 
         # 直接把 Runner 传进来的 Group 往下传递
-        self.model = Qwen2MoeModel(config, tp_group=self.tp_group, ep_group=self.ep_group)
+        self.model = Qwen2MoeModel(
+            config,
+            tp_group=self.tp_group,
+            ep_group=self.ep_group,
+            moe_backend=moe_backend,
+        )
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, tp_group=self.tp_group)
         
         if config.tie_word_embeddings:

@@ -24,11 +24,15 @@ def main(args):
         enforce_eager=args.enforce_eager, 
         tp_size=args.tp_size,    # 传给 Config
         ep_size=args.ep_size,    # 传给 Config
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        max_num_seqs=args.max_num_seqs,
+        gpu_memory_utilization=args.gpu_memory_utilization,
     )
 
     print(f"Generating {num_seqs} random sequences for benchmarking...")
     prompt_token_ids = [
-        [randint(0, 10000) for _ in range(randint(128, max_input_len))]
+        [randint(0, 10000) for _ in range(randint(args.min_input_len, max_input_len))]
         for _ in range(num_seqs)
     ]
     
@@ -36,7 +40,7 @@ def main(args):
         SamplingParams(
             temperature=0.6, 
             ignore_eos=True, 
-            max_tokens=randint(128, max_output_len)
+            max_tokens=randint(args.min_output_len, max_output_len)
         )
         for _ in range(num_seqs)
     ]
@@ -79,10 +83,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--ep-size", type=int, default=1)
-    parser.add_argument("--enforce-eager", type=bool, default=True)
+    parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
+    parser.add_argument("--max-num-seqs", type=int, default=512)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
     
     parser.add_argument("--num-seqs", type=int, default=256)
+    parser.add_argument("--min-input-len", type=int, default=128)
     parser.add_argument("--max-input-len", type=int, default=1024)
+    parser.add_argument("--min-output-len", type=int, default=128)
     parser.add_argument("--max-output-len", type=int, default=1024)
     
     args = parser.parse_args()

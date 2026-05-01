@@ -25,20 +25,24 @@ def run_single_test(args, tp, ep, output_file):
             args.model_path, 
             enforce_eager=args.enforce_eager, 
             tp_size=tp, 
-            ep_size=ep
+            ep_size=ep,
+            max_model_len=args.max_model_len,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+            gpu_memory_utilization=args.gpu_memory_utilization,
         )
 
         # 构造负载
         seed(0)
         prompt_token_ids = [
-            [randint(0, 10000) for _ in range(randint(128, args.max_input_len))]
+            [randint(0, 10000) for _ in range(randint(args.min_input_len, args.max_input_len))]
             for _ in range(args.num_seqs)
         ]
         sampling_params = [
             SamplingParams(
                 temperature=0.6, 
                 ignore_eos=True, 
-                max_tokens=randint(128, args.max_output_len)
+                max_tokens=randint(args.min_output_len, args.max_output_len)
             )
             for _ in range(args.num_seqs)
         ]
@@ -80,11 +84,14 @@ def run_single_test(args, tp, ep, output_file):
         return None
 
 def main(args):
-    sweep_configs = [
-        (1, 1),           # 1卡
-        (1, 2), (2, 1),   # 2卡 (EP模式 vs TP模式)
-        (4, 1), (2, 2), (1, 4) # 4卡 (全EP vs 全TP vs 混合模式)
-    ]
+    if args.configs:
+        sweep_configs = [tuple(map(int, item.split(","))) for item in args.configs.split(";")]
+    else:
+        sweep_configs = [
+            (1, 1),           # 1卡
+            (1, 2), (2, 1),   # 2卡 (EP模式 vs TP模式)
+            (4, 1), (2, 2), (1, 4) # 4卡 (全EP vs 全TP vs 混合模式)
+        ]
 
     output_file = "benchmark_summary.txt"
     if os.path.exists(output_file):
@@ -114,10 +121,17 @@ if __name__ == "__main__":
     parser.add_argument("--max-input-len", type=int, default=512)
     parser.add_argument("--max-output-len", type=int, default=512)
     
-    parser.add_argument("--enforce-eager", type=bool, default=True)
+    parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
+    parser.add_argument("--max-num-seqs", type=int, default=512)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
+    parser.add_argument("--configs", type=str, default="")
     
     parser.add_argument("--tp-size", type=int, default=2)
     parser.add_argument("--ep-size", type=int, default=1)
+    parser.add_argument("--min-input-len", type=int, default=128)
+    parser.add_argument("--min-output-len", type=int, default=128)
 
     args = parser.parse_args()
     

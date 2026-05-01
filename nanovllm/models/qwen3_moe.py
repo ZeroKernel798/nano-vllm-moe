@@ -13,7 +13,7 @@ from nanovllm.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from nanovllm.executor.moe.backends import TritonMoEBackend
+from nanovllm.executor.moe.blocks import BaseSparseMoeBlock
 
 # Alias for local backward compatibility and readability within this module.
 Qwen3MoeAttention = Qwen3AttentionBlock
@@ -106,121 +106,28 @@ class Qwen3MoeEagerSparseMoeBlock(nn.Module):
 
 
 # Triton Group-GEMM + TP + EP 版本的 MoE
-class Qwen3MoeSparseMoeBlock(nn.Module):
+class Qwen3MoeSparseMoeBlock(BaseSparseMoeBlock):
     def __init__(
         self,
         config,
         tp_group: Optional[dist.ProcessGroup] = None,
         ep_group: Optional[dist.ProcessGroup] = None,
+        experts_backend: str = "fused",
     ) -> None:
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.global_num_experts = config.num_experts
-        self.top_k = config.num_experts_per_tok
-        self.moe_intermediate_size = config.moe_intermediate_size
-        
-        self.tp_group = tp_group
-        self.ep_group = ep_group
-        
-        self.tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
-        self.tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
-        self.ep_size = dist.get_world_size(ep_group) if ep_group is not None else 1
-        self.ep_rank = dist.get_rank(ep_group) if ep_group is not None else 0
-        self.backend = TritonMoEBackend(tp_group=tp_group, ep_group=ep_group)
-        
-        self.local_num_experts = self.global_num_experts // self.ep_size
-        self.local_inter_size = self.moe_intermediate_size // self.tp_size
-
-        self.w13_stacked = nn.Parameter(torch.zeros(
-            self.local_num_experts, 2 * self.local_inter_size, self.hidden_size
-        ))
-        self.w2_stacked = nn.Parameter(torch.zeros(
-            self.local_num_experts, self.hidden_size, self.local_inter_size
-        ))
-        self.w13_stacked.weight_loader = self.load_hybrid_moe_weight
-        self.w2_stacked.weight_loader = self.load_hybrid_moe_weight
-
-        # Gate 层
-        self.gate = nn.Linear(self.hidden_size, self.global_num_experts, bias=False)
-        self.gate.weight.weight_loader = self.load_replicated_weight
-
-        # 注意：Qwen3 不含 Shared Expert，无需创建 Shared Expert 和对应的 CUDA Stream
-
-    def load_replicated_weight(self, param, loaded_weight, **kwargs):
-        with torch.no_grad():
-            param.copy_(loaded_weight)
-
-    def load_hybrid_moe_weight(self, param, loaded_weight, global_expert_id, shard_id=None, **kwargs):
-        with torch.no_grad():
-            if not (self.ep_rank * self.local_num_experts <= global_expert_id < (self.ep_rank + 1) * self.local_num_experts):
-                return 
-            local_id = global_expert_id % self.local_num_experts
-            start = self.tp_rank * self.local_inter_size
-            size = self.local_inter_size
-            if shard_id in [0, "w1", "gate_proj"]: 
-                param.data[local_id].narrow(0, 0, size).copy_(loaded_weight.narrow(0, start, size))
-            elif shard_id in [1, "w3", "up_proj"]: 
-                param.data[local_id].narrow(0, size, size).copy_(loaded_weight.narrow(0, start, size))
-            elif shard_id in [None, "w2", "down_proj"]: 
-                param.data[local_id].copy_(loaded_weight.narrow(1, start, size))
+        super().__init__(
+            config,
+            tp_group=tp_group,
+            ep_group=ep_group,
+            renormalize_router_weights=True,
+            experts_backend=experts_backend,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         x = hidden_states.view(-1, self.hidden_size).contiguous()
-        M, H = x.shape
-        model_dtype = x.dtype
-
-        # 1. 路由计算
-        router_logits = self.gate(x)
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
-        topk_weights, topk_ids = torch.topk(routing_weights, self.top_k, dim=-1)
-        
-        # 【核心差异】：Qwen3 必须对 topk 的权重进行归一化
-        topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
-        # 强制转换为 float32 传入 Triton 算子，防止精度丢失
-        topk_weights = topk_weights.to(torch.float32)
-
-        # 2. EP Token 分发 (All-To-All)
-        dispatch_state = self.backend.dispatch(
-            x=x,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            local_num_experts=self.local_num_experts,
-            top_k=self.top_k,
-        )
-        recv_x = dispatch_state["recv_x"]
-        recv_local_ids = dispatch_state["recv_local_ids"]
-        recv_weights = dispatch_state["recv_weights"]
-        permute_indices = dispatch_state["permute_indices"]
-        s_list = dispatch_state["s_list"]
-        r_list = dispatch_state["r_list"]
-
-        # 3. 执行 Triton Group-GEMM
-        local_out_fp32 = self.backend.compute(
-            recv_x=recv_x,
-            recv_local_ids=recv_local_ids,
-            recv_weights=recv_weights,
-            w13_stacked=self.w13_stacked,
-            w2_stacked=self.w2_stacked,
-            local_num_experts=self.local_num_experts,
-            local_inter_size=self.local_inter_size,
-            hidden_size=self.hidden_size,
-            model_dtype=model_dtype,
-        )
-
-        # 4/5/6. 回收 + 规约
-        output = self.backend.combine(
-            local_out_fp32=local_out_fp32,
-            model_dtype=model_dtype,
-            m_tokens=M,
-            hidden_size=H,
-            top_k=self.top_k,
-            permute_indices=permute_indices,
-            s_list=s_list,
-            r_list=r_list,
-        )
+        topk_weights, topk_ids = self.route(x)
+        output = self.apply_sparse_experts(x, topk_weights, topk_ids)
         return output.view(orig_shape)
-
 
 class Qwen3MoeDecoderLayer(nn.Module):
     def __init__(
@@ -229,7 +136,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         layer_idx: int = -1,
         tp_group: Optional[dist.ProcessGroup] = None,
         ep_group: Optional[dist.ProcessGroup] = None,
-        group_gemm_enable: bool = True
+        group_gemm_enable: bool = True,
+        moe_backend: str = "fused",
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3MoeAttention(
@@ -251,7 +159,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             if group_gemm_enable:
-                self.mlp = Qwen3MoeSparseMoeBlock(config=config, tp_group=tp_group, ep_group=ep_group)
+                self.mlp = Qwen3MoeSparseMoeBlock(
+                    config=config,
+                    tp_group=tp_group,
+                    ep_group=ep_group,
+                    experts_backend=moe_backend,
+                )
             else:
                 self.mlp = Qwen3MoeEagerSparseMoeBlock(config=config, tp_group=tp_group, ep_group=ep_group)
         else:
@@ -285,14 +198,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
 
 class Qwen3MoeModel(nn.Module):
-    def __init__(self, config, tp_group=None, ep_group=None) -> None:
+    def __init__(self, config, tp_group=None, ep_group=None, moe_backend: str = "fused") -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, tp_group=tp_group
         )
         self.layers = nn.ModuleList(
             [
-                Qwen3MoeDecoderLayer(config, layer_idx, tp_group, ep_group)
+                Qwen3MoeDecoderLayer(config, layer_idx, tp_group, ep_group, moe_backend=moe_backend)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -321,13 +234,19 @@ class Qwen3MoeForCausalLM(nn.Module):
         config, 
         tp_group: Optional[dist.ProcessGroup] = None, 
         ep_group: Optional[dist.ProcessGroup] = None,
+        moe_backend: str = "fused",
         **kwargs 
     ) -> None:
         super().__init__()
         self.tp_group = tp_group
         self.ep_group = ep_group
 
-        self.model = Qwen3MoeModel(config, tp_group=self.tp_group, ep_group=self.ep_group)
+        self.model = Qwen3MoeModel(
+            config,
+            tp_group=self.tp_group,
+            ep_group=self.ep_group,
+            moe_backend=moe_backend,
+        )
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, tp_group=self.tp_group)
         
         if config.tie_word_embeddings:

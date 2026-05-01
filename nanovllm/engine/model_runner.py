@@ -61,6 +61,8 @@ class ModelRunner:
             model_kwargs["tp_group"] = self.tp_group
         if "ep_group" in model_init_params:
             model_kwargs["ep_group"] = self.ep_group
+        if "moe_backend" in model_init_params:
+            model_kwargs["moe_backend"] = config.moe_backend
         self.model = model_cls(hf_config, **model_kwargs)
         load_model(self.model, config.model)
         self.sampler = Sampler()
