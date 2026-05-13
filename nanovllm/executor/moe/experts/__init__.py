@@ -1,11 +1,11 @@
 from .base import MoEExpertsKernel
-from .eager import TransformersEagerExperts
-from .sglang import MiniSglangExperts
-from .triton_grouped_gemm import TritonGroupedGemmExperts
+from .eager_experts import EagerExperts
+from .fused import FusedExperts
+from .optimized import OptimizedExperts
 
 __all__ = [
-    "MiniSglangExperts",
+    "EagerExperts",
+    "FusedExperts",
     "MoEExpertsKernel",
-    "TransformersEagerExperts",
-    "TritonGroupedGemmExperts",
+    "OptimizedExperts",
 ]

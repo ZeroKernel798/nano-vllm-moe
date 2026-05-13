@@ -13,6 +13,7 @@ from nanovllm.layers.linear import (
     RowParallelLinear,
 )
 from nanovllm.layers.rotary_embedding import get_rope
+from nanovllm.quantization.base_config import QuantizationConfig
 
 
 class Qwen2Attention(nn.Module):
@@ -25,6 +26,7 @@ class Qwen2Attention(nn.Module):
         max_position: int = 4096 * 32,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -45,11 +47,13 @@ class Qwen2Attention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=True,
+            quant_method=quant_config.get_quant_method(self, "self_attn.qkv_proj") if quant_config else None,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
+            quant_method=quant_config.get_quant_method(self, "self_attn.o_proj") if quant_config else None,
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -85,17 +89,20 @@ class Qwen2MLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
+            quant_method=quant_config.get_quant_method(self, "mlp.gate_up_proj") if quant_config else None,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
+            quant_method=quant_config.get_quant_method(self, "mlp.down_proj") if quant_config else None,
         )
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
@@ -112,6 +119,7 @@ class Qwen2DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen2Config,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen2Attention(
@@ -122,11 +130,13 @@ class Qwen2DecoderLayer(nn.Module):
             rope_theta=getattr(config, "rope_theta", 1000000),
             # rope_scaling=getattr(config, "rope_scaling", None),
             rope_scaling=None,
+            quant_config=quant_config,
         )
         self.mlp = Qwen2MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
+            quant_config=quant_config,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -155,13 +165,14 @@ class Qwen2Model(nn.Module):
     def __init__(
         self,
         config: Qwen2Config,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
         )
         self.layers = nn.ModuleList(
-            [Qwen2DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [Qwen2DecoderLayer(config, quant_config=quant_config) for _ in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -187,9 +198,9 @@ class Qwen2ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(self, config: Qwen2Config) -> None:
+    def __init__(self, config: Qwen2Config, quant_config: QuantizationConfig | None = None) -> None:
         super().__init__()
-        self.model = Qwen2Model(config)
+        self.model = Qwen2Model(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data

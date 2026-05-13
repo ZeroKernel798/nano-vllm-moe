@@ -3,22 +3,9 @@ WikiText-2 (wikitext-2-raw-v1) sliding-window perplexity for HuggingFace causal 
 
 Use cases
 ---------
-- **BF16 / FP16 baseline**: point ``--model-path`` at a standard HF checkpoint
-  (``torch_dtype`` matches weights).
-
-- **nano-vllm FP8 exports** (``qweight`` / ``weight_scale``): use ``scripts/eval/eval_ppl_nano_fp8.py`` in this
-  repo (dequantizes weights to BF16, then same WikiText loop). See that script for W8A8 vs W8A16
-  interpretation.
-
-W8A16 vs W8A8 (this repo)
--------------------------
-- **W8A16** (``fp8_scheme: "w8a16"``): FP8 weights, BF16 activations — export e.g. with
-  ``nanovllm/quant/quant_w8a16_fp8.py`` (sets ``quantization_config`` in ``config.json``).
-- **W8A8 static** (``fp8_scheme: "w8a8_static"``): FP8 weights + static FP8 activations —
-  ``nanovllm/quant/quant_w8a8_fp8.py``.
-
-If you meant **A8W16** (activations 8-bit, weights BF16), that is **not** the same as W8A16
-and is not implemented as an ``fp8_scheme`` here.
+- **BF16 / FP16 baseline**: point ``--model-path`` at a standard HF checkpoint.
+- The old nano FP8 dequant-proxy helpers were removed with the legacy quantization stack.
+  Run FP8 exports through nano-vllm directly using ``scripts/generation/bench.py``.
 
 Example
 -------

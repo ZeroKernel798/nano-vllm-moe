@@ -1,226 +1,138 @@
-# Nano-vLLM-MOE
+# Nano-vLLM-MoE
 
-本项目是以Nano-vLLM项目为基底，添加了对Qwen2、Qwen3系列的Moe模型支持，并提供了EP、TP以及EP、TP混合的调度实现。用于在现有的Nano-vLLM的基础上，学习和分析LLM的分布式并行策略。原项目地址为：https://github.com/GeeeekExplorer/nano-vllm.git
+Nano-vLLM-MoE is a compact vLLM-style inference playground focused on three current tracks:
 
-## 主要特点
+1. **MoE runtime refactor**: router, prepare/finalize, expert compute, and MoE block are separated so each part can be tested independently.
+2. **Chunked prefill**: scheduler and sequence state support partial prefill, with `prefill_first` and `decode_first` policies.
+3. **Quantization refactor**: the active line is RTX 4090 / 7B first: BF16 baseline -> W8A16 -> FP8 KV cache -> W8A8.
 
-* Tensor Parallelism — Column/Row 并行分片策略，显著提升计算密集型任务的硬件利用率
-* Expert Parallelism — 专为大规模 MoE 设计的专家分片架构，支持超大规模专家库的高效驻留与并行调度
-* Hybrid TP+EP — 灵活的嵌套并行模式，允许动态调整并行粒度，实现通信与计算的最优平衡
-* Triton Group-GEMM — 使用 Triton 实现了 Group-Gemm 等核心算子，显著降低 MoE 层通信延迟
-* Expert Overlap Execution — 支持 Shared Expert 与 Sparse Expert 并行执行，利用计算掩盖 all-to-all 通信延迟
-* Benchmarking Suite — 完善的性能评测套件，提供 TTFT、TPOT 等详细指标输出
-* Preserved Optimizations — 完整保留了原项目的 Prefix caching, Torch compilation 以及 CUDA graph 等生产级优化
-* MoE-Aware CUDA Graph — 计划绕过动态路由的同步限制，实现 MoE 全路径的 CUDA Graph 录制
-* Quantization — 支持 FP8 W8A16 / W8A8 static 与 INT8 W8A16 / W8A8 static 量化，显著缓解 Decode 阶段的带宽瓶颈，进一步推高生成吞吐
+EP is intentionally kept minimal: only the baseline `torch` all-to-all prepare/finalize path remains. Historical reports are archived only in `docs/README_legacy.md`; old experiment notes and stale benchmark plans were removed to keep the project clean.
 
-## 安装
+## Current Scope
 
-git clone https://github.com/ZeroKernel798/nano-vllm-moe.git
+| Track | Status | Main Files |
+| --- | --- | --- |
+| MoE runtime | Stage-stable refactor | `nanovllm/executor/moe/`, `scripts/moe/` |
+| Chunked prefill | Active scheduler feature | `nanovllm/engine/scheduler.py`, `nanovllm/engine/sequence.py`, `scripts/generation/chunked_prefill_bench.py` |
+| Quantization | Active refactor line | `nanovllm/quantization/`, `scripts/quantization/`, `scripts/kv_cache/` |
+| EP | Baseline only | `nanovllm/executor/moe/prepare_finalize/torch_alltoall.py` |
 
-cd nano-vllm-moe
+## MoE Runtime
 
-pip install -e .
+The MoE path is now structured as:
 
-## 模型下载
-
-推荐使用内置的下载脚本从 ModelScope 极速获取模型
-
-python scripts/tools/downmodel.py --model-id qwen/Qwen1.5-MoE-A2.7B-Chat --cache-dir ./my_models
-
-
-## Benchmark
-
-使用 `scripts/benchmarks/ep_bench.py` 模拟生产环境下随机输入序列，测试Group-Gemm相关实现的性能
-
-**测试配置**
-- Hardware: NVIDIA A100-SXM4-80GB (HBM2e / NVLink)
-- Model: Qwen1.5-MoE-A2.7B-Chat
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 128–1024 tokens
-- Output Length: Randomly sampled between 128–1024 tokens
-- Parallelism Strategy: TP = 1, EP = 1
-
-**测试结果:**
-|          实现方案          | input  tokens | output tokens | 解码吞吐（tokens/s）| 总吞吐（tokens/s）|
-|---------------------------|---------------|-------------- |--------------------|------------------|
-|        Python Loop        |     155216    |     153174    |      156.67        |      315.42      |      
-|     Triton Group-GEMM     |     155216    |     153174    |      1286.5        |      2590.1      |        
-|Triton Group-GEMM w Overlap|     155216    |     153174    |      1328.5        |      2674.7      |   
-
-
-
-可使用 `scripts/benchmarks/ep_tp_bench.py` 模拟生产环境下随机输入序列多卡推理测试，横向对比各种并行策略，一键生成测试结果
-
-**测试配置**
-- Hardware: NVIDIA A100-SXM4-80GB (HBM2e / NVLink)
-- Model: Qwen1.5-MoE-A2.7B-Chat
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 128–512 tokens
-- Output Length: Randomly sampled between 128–512 tokens
-- Expert Execution Logic: Group-Gemm + Overlap
-
-**测试结果:**
-| 并行配置  | 显卡数 | 解码吞吐（tokens/s） | 总吞吐（tokens/s）|
-|----------|-------|--------------------|--------------------|
-|TP=1, EP=1|   1   |      2240.64       |     4609.59        |
-|TP=1, EP=2|   2   |      1937.79       |     3986.54        |
-|TP=2, EP=1|   2   |      2455.39       |     5051.39        |
-|TP=2, EP=2|   4   |      1821.96       |     3748.26        |
-|TP=4, EP=1|   4   |      2430.07       |     4999.32        |
-
-
-可使用 `scripts/benchmarks/pd_bench.py` 输入给定长度和批次的序列，分析 prefill 和 decode 阶段，不同分布式策略的性能
-
-**测试配置**
-- Hardware: NVIDIA A100-SXM4-80GB (HBM2e / NVLink)
-- Model: Qwen1.5-MoE-A2.7B-Chat
-- Expert Execution Logic: Group-Gemm + Overlap
-
-**测试结果:**
-#### 🚀 Prefill 阶段性能 (Prefill Stage)
-*关注点：TP 对计算密集型任务的加速比，以及长文本下的延迟表现。*
-| 阶段    |   测试配置   | 吞吐量 (Throughput) | TTFT (Latency) | 加速比 |  性能损耗/增益说明  |
-|---------|-------------|---------------------|---------------|--------|-------------------|
-| Prefill | TP=1,EP=1,BS=128,L=1024 | 27340.26 tok/s | 2730.31 ms | 1.00x |    -----    |
-| Prefill | TP=2,EP=1,BS=128,L=1024 | 40771.19 tok/s | 1797.09 ms | 1.49x | 计算/通信比平衡，收益显著 |
-| Prefill | TP=1,EP=2,BS=128,L=1024 | 23027.90 tok/s | 3254.64 ms | 0.84x | all_to_all 通信开销过大 |
-| Prefill | TP=2,EP=2,BS=128,L=1024 | 32439.96 tok/s | 2332.75 ms | 1.19x | 混合并行抵消了部分 TP 收益 |
-| Prefill | TP=4,EP=1,BS=128,L=1024 | 54041.02 tok/s | 1384.21 ms | 1.98x | 4 卡并行接近 2 倍收益，受限于小模型计算量 |
-| Prefill | TP=1,EP=1,BS=64,L=4096 | 26460.86 tok/s | 5285.74 ms | 1.00x | ----- |
-| Prefill | TP=2,EP=1,BS=64,L=4096 | 40035.93 tok/s | 3501.27 ms | 1.51x | 序列变长，计算密度增加，TP 效率提升 |
-| Prefill | TP=1,EP=2,BS=64,L=4096 | 22754.84 tok/s | 6129.04 ms | 0.86x | 模型太小，EP 依旧亏损 |
-| Prefill | TP=2,EP=2,BS=64,L=4096 | 32328.42 tok/s | 4356.89 ms | 1.22x | 较上一批测试 有轻微提升 |
-| Prefill | TP=4,EP=1,BS=64,L=4096 | 52433.40 tok/s | 2693.42 ms | 1.98x | 达到目前框架在 2.7B 模型下的性能瓶颈 |
-
-#### ⚡ Decode 阶段性能 (Decode Stage)
-*关注点：通信延迟对小模型生成速度的影响，寻找 Batch Size 的性能拐点。*
-| 阶段    |   测试配置   | 吞吐量 (Throughput) | TPOT (Latency) | 加速比 |  性能损耗/增益说明  |
-|---------|-------------|---------------------|---------------|--------|-------------------|
-| Decode | TP=1,EP=1,BS=1,L=4 | 9.28 tok/s | 107.56 ms | 1.00x | ----- |
-| Decode | TP=2,EP=2,BS=1,L=4 | 7.65 tok/s | 130.72 ms | 0.82x | 混合并行带来的同步延迟导致响应变慢 |
-| Decode | TP=4,EP=1,BS=1,L=4 | 9.34 tok/s | 107.17 ms | 1.01x | 计算量极小，4 卡同步开销抵消了计算收益 |
-| Decode | TP=1,EP=1,BS=256,L=4 | 4864.58 tok/s | 53.00 ms | 1.00x | ----- | 
-| Decode | TP=2,EP=2,BS=256,L=4 | 2945.15 tok/s | 87.48 ms | 0.61x | 复杂的分布式链路导致性能大幅跌落 |
-| Decode | TP=4,EP=1,BS=256,L=4 | 4032.50 tok/s | 64.20 ms | 0.83x | 卡间 All-Reduce 耗时超过计算耗时 |
-> **Bottleneck analysis**: <small>
-经过对 Qwen-1.5-MoE-2.7B 的深度压测，我们发现多卡并行（TP/EP）在 decode 阶段表现不佳，这并非框架缺陷，而是由以下两个核心技术瓶颈决定的：
-1、计算密度不足。对于 2.7B 这样的小规模模型，Decode 阶段单次算子的执行时间（us级）已经接近甚至小于 NVLink 的同步延迟。在 TP 或 EP 模式下，多卡之间频繁的 all-reduce 或 all-to-all 通信开销完全盖过了并行带来的计算收益。在这种级别的计算任务面前，“力大砖飞”的分布式策略反而成了性能累赘。2、MoE 动态特性对 CUDA Graph 的局限。目前的 MoE 实现采用了动态的 Token 分发逻辑，这需要 CPU 实时介入来决定下一阶段的计算规模。这种数据依赖的动态调度与 CUDA Graph 要求的“全静态计算图”存在天然冲突，导致目前无法通过录制 Graph 来消除 Python 调度和 Kernel Launch 的 Overhead。这也是 BS=1 时 TPOT 难以进一步下探的技术原因。后续将考虑引入量化以及 MoE 逻辑重构，利用 CUDA Graph 进一步优化，全部测试结果见docs/pd_separate_report.md</small>
-
-## INT8 量化支持（Qwen1.5-0.5B，RTX 3080）
-
-### 量化方案
-
-| 方案 | 权重精度 | 激活精度 | 校准要求 | 适用卡型 |
-|------|---------|---------|---------|---------|
-| `int8_w8a16` | INT8 | BF16 | 无 | 全部 |
-| `int8_w8a8_static` | INT8 | INT8（静态 scale）| 需校准 | Ampere+（CC≥8.0） |
-
-**关键设计**
-
-- **W8A16（权重量化）**：权重 int8 存储，推理时 dequant 至 BF16 做标准矩阵乘，无硬件约束，开箱即用。
-- **W8A8 static（静态激活量化）**：通过 `scripts/quantize/quantize.py` 离线标定每层 `input_scale`，运行时用固定 scalar 量化激活（比动态 per-token abs-max 少一轮全局 reduce）；大 batch（M > 32）走 `torch._int_mm` cuBLAS INT8 GEMM，小 batch（decode）自动回退至 BF16 保证速度。
-
-### 快速使用
-
-```bash
-# 1. 生成 INT8 W8A16 checkpoint（无需校准）
-python scripts/quantize/quantize.py \
-    --model-path /path/to/Qwen1.5-0.5B-Chat \
-    --output-path /path/to/Qwen1.5-0.5B-Chat-INT8 \
-    --scheme int8_w8a16
-
-# 2. 生成 INT8 W8A8 static checkpoint（带激活校准）
-python scripts/quantize/quantize.py \
-    --model-path /path/to/Qwen1.5-0.5B-Chat \
-    --output-path /path/to/Qwen1.5-0.5B-Chat-INT8-Static \
-    --scheme int8_w8a8_static \
-    --calib-samples 64 --calib-seqlen 512
-
-# 3. 推理（model_type 由 config.json 中 quantization_type 字段自动路由）
-python scripts/examples/example_quant.py --scheme int8_w8a8
-python scripts/examples/example_quant.py --scheme int8_w8a8_static
-
-# 4. 单元测试
-python -m pytest tests/quant/test_int8_linear.py -v
-
-# 5. WikiText-2 困惑度评估（需要网络或本地数据集）
-python scripts/eval/eval_ppl_nano_int8.py \
-    --model-path /path/to/Qwen1.5-0.5B-Chat-INT8 \
-    --max-length 2048 --stride 512
+```text
+router -> prepare/finalize -> expert backend -> finalize output
 ```
 
-### 性能数据（RTX 3080，Qwen1.5-0.5B-Chat，`enforce_eager=True`）
+Expert backends:
 
-| 方案 | Decode TPS | 相对 BF16 | 显存（权重） |
-|------|-----------|---------|------------|
-| BF16 baseline | ~104 tok/s | 1.00x | ~1.0GB |
-| INT8 W8A16 | ~87 tok/s | 0.84x | ~0.5GB（−50%） |
-| INT8 W8A8 static | ~87 tok/s | 0.84x | ~0.5GB（−50%） |
+| Backend | Role | File |
+| --- | --- | --- |
+| `eager` | correctness/reference path | `nanovllm/executor/moe/experts/eager_experts.py` |
+| `optimized` | current practical optimized path | `nanovllm/executor/moe/experts/optimized.py` |
+| `fused` | Triton grouped-GEMM experiment | `nanovllm/executor/moe/experts/fused.py` |
 
-> **说明**：RTX 3080 decode 阶段 batch=1，INT8 GEMM 相比 BF16 无明显 compute 收益；主要价值在于**显存减半**，可在相同 GPU 上容纳更大模型或更长上下文。Ampere A100 / H100 上 W8A8 的 INT8 Tensor Core 加速会更显著。
+EP is not a performance claim right now. The only retained EP backend is the baseline `torch` all-to-all path so distributed MoE semantics remain testable without carrying old prototype clutter.
 
----
+## Chunked Prefill
 
-## Llama 3.1 8B 量化与基线对比（RTX 4090，单卡）
+Chunked prefill is a scheduler-level feature for splitting long prefill requests into smaller scheduled chunks. Two policies are kept:
 
-以下数据来自本仓库中的 `scripts/benchmarks/bench.py`、`scripts/benchmarks/pd_bench.py` 与 WikiText 困惑度脚本，详细原始表格见 `docs/fp8_bf16_bench.md`、`docs/pd_separate_report_bf16.md`、`docs/pd_separate_report_fp8_w8a8.md`、`docs/pd_separate_report_fp8_w8a16.md` 与 `docs/wikitext.md`。硬件为 **NVIDIA GeForce RTX 4090**，模型为 **Meta Llama 3.1 8B** 系列；P/D 测试为 **TP=1, EP=1**。
+| Policy | Behavior | Use |
+| --- | --- | --- |
+| `prefill_first` | continue prefill chunks before decode | simple correctness/default behavior |
+| `decode_first` | prioritize decode between prefill chunks | latency-control experiments |
 
-### 端到端混合负载（scripts/benchmarks/bench.py）
+Main benchmark:
 
-**测试配置（与 `docs/fp8_bf16_bench.md` 一致）**
+```bash
+python scripts/generation/chunked_prefill_bench.py \
+  --model-path /path/to/model \
+  --max-model-len 0 \
+  --phases 1,2,3
+```
 
-- Hardware: NVIDIA GeForce RTX 4090
-- Model: Llama 3.1 8B（BF16 基座 / W8A8 ModelOpt 导出 / W8A16 纯权重量化导出）
-- Parallelism: TP = 1, EP = 1
-- Sequences: 256
-- Input / output length: 随机长度（`--random-lens`），上界为 1024 tokens，下界为 100 tokens
-- max_model_len: 4096
+## RTX 4090 7B Quantization Stack
 
-**测试结果**
+The quantization refactor is intentionally 7B-first. Smaller models can still be used for smoke tests, but README results and project direction should be driven by Qwen2.5-7B on RTX 4090.
 
-| 方案 | wall_time (s) | prefill_tps | decode_tps | total_gen_tokens |
-|------|---------------|-------------|------------|------------------|
-| BF16 基线 | 74.900 | 11070.90 | 2454.68 | 133966 |
-| FP8 W8A8 | 69.216 | 12908.28 | 2620.51 | 133966 |
-| FP8 W8A16 | 99.906 | 4182.87 | 2858.90 | 133966 |
+Current stage order:
 
-*分析要点：* 在相同随机负载与总生成 token 数下，**W8A8** 总墙钟时间最短，prefill / decode 吞吐均高于 BF16，说明静态 FP8 激活 + FP8 权重路径在本机与 cuBLASLt 组合下对混合负载更友好。**W8A16** 的 prefill_tps 明显偏低而 decode_tps 高于 BF16，与「prefill 偏算力、W8A16 Triton 路径与 BF16 主路径效率差异；decode 偏权重带宽、FP8 权重量更省」的典型现象一致。
+| Stage | Mode | Purpose |
+| --- | --- | --- |
+| 0 | BF16 | baseline quality, latency, and memory |
+| 1 | W8A16 | stable weight-only FP8 checkpoint/runtime path |
+| 2 | W8A16 + FP8 KV | long-context memory pressure and KV accuracy |
+| 3 | W8A8 | aggressive activation-quantized mode after W8A16/KV are stable |
 
-### Prefill / Decode 阶段分离（scripts/benchmarks/pd_bench.py）
+### Latest 7B Baseline
 
-**测试配置**
+Benchmark setup: 2026-05-13, 1x RTX 4090 24GB, Qwen2.5-7B-Instruct, fixed synthetic prompt `input=512, output=64`, `max_model_len=2048`, `gpu_memory_utilization=0.9`, one warmup and one measured run. Evidence root: `.remote-logs/quantization/4090_7b_stack_20260513/` on the remote validation machine.
 
-- Hardware: NVIDIA GeForce RTX 4090
-- Model: 同上，单卡 TP=1, EP=1
-- Prefill：多组 (batch, seq_len)；
-- Decode：短提示 + 长生成阶段下的 batch 扫描
+| Mode | Checkpoint size | PPL proxy | Bench prefill TPS | Bench decode TPS | Memory-run prefill TPS | Memory-run decode TPS | Peak reserved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| BF16 | 15.24 GB | 7.4367 | 10634.5 | 62.50 | 489.6 | 61.81 | 19.98 GB |
+| W8A16 | 8.72 GB | 7.4772 | 5258.7 | 15.22 | 668.7 | 15.26 | 20.92 GB |
 
-**代表性对比（摘自数据报告，单位 tok/s）**
+W8A16 checkpoint contract is healthy (`196` qweight tensors and `196` weight-scale tensors). Current SM89 runtime uses per-forward BF16 dequant matmul, so W8A16 is a memory/quality milestone, not a speed win yet.
 
-| 阶段 | 配置 | BF16 | W8A8 | W8A16 |
-|------|------|------|------|-------|
-| Prefill | BS=32, L=512 | 10994.44 | 11209.68 | 9712.15 |
-| Prefill | BS=32, L=4096 | 10081.92 | 10452.48 | 9027.82 |
-| Decode | BS=1, L=4 | 60.40 | 79.53 | 80.59 |
-| Decode | BS=256, L=4 | 7686.51 | 9404.59 | 7010.33 |
+### Latest 7B FP8 KV Probe
 
-*分析要点：* **Prefill** 上 BF16 在多数配置下略逊于或接近 W8A8，W8A16 普遍低于 BF16（大块 GEMM 上 BF16 Tensor Core 主路径仍很成熟）。**Decode** 上 W8A8 在中高 batch 下相对 BF16 提升明显（权重更省带宽）；W8A16 在 BS=1 略优，在 BS=256 时低于 BF16，与实现路径和 batch 形态有关。完整矩阵见上述 `docs/pd_separate_report_*.md`。
+Same 7B W8A16 checkpoint, `output=16`, native FP8 paged decode, BF16 KV reference and FP8 KV in the same script.
 
-### WikiText-2 困惑度（scripts/eval/eval_ppl_wikitext.py / scripts/eval/eval_ppl_nano_fp8.py）
+| Prompt | KV mode | KV storage | Prefill TPS | Decode TPS | Wall time | Peak reserved | Token match |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8192 | BF16 KV | 11.09 GB | 4224.7 | 8.48 | 3.71 s | 21.16 GB | reference |
+| 8192 | FP8 KV | 2.90 GB | 7811.0 | 8.63 | 2.79 s | 21.17 GB | 1/16 |
+| 16384 | BF16 KV | 10.01 GB | 5673.4 | 9.27 | 4.51 s | 21.31 GB | reference |
+| 16384 | FP8 KV | 1.81 GB | 9623.6 | 10.35 | 3.15 s | 21.31 GB | 2/16 |
 
-**测试配置**
+FP8 KV clearly reduces KV storage, but token match is not acceptable yet. The next task is logits-divergence debugging before FP8 KV can become a default mode.
 
-- Dataset: wikitext-2-raw-v1，split=test
-- 滑动窗口：max_length=2048，stride=512（与 `docs/wikitext.md` 中记录一致）
-- FP8 侧：鉴于 HuggingFace 原生框架不支持 FP8 算子，采用反量化代理评估（De-quantization Proxy），即将 FP8 权重还原为 BF16 后进行推理。该指标反映了 **权重量化（Weight Quantization）** 带来的精度损耗上限
+## Repository Map
 
-**测试结果**
+| Path | Purpose |
+| --- | --- |
+| `nanovllm/engine/` | scheduler, sequence state, model runner, block manager |
+| `nanovllm/executor/moe/` | modular MoE runtime |
+| `nanovllm/quantization/` | quantization method registry and FP8 runtime |
+| `scripts/moe/` | MoE local compute, backend, and baseline EP scripts |
+| `scripts/generation/` | generation and chunked prefill benchmarks |
+| `scripts/quantization/` | FP8 export/eval/runtime benchmark suite |
+| `scripts/kv_cache/` | FP8 KV validation and microbenchmarks |
+| `opt/` | current refactor notes only |
+| `docs/README_legacy.md` | archived legacy README |
 
-| 模型 | WikiText-2 (test) perplexity |
-|------|------------------------------|
-| BF16 基线 | ≈ 6.4008 |
-| FP8 W8A8（反量化评估） | ≈ 6.4207 |
-| FP8 W8A16（反量化评估） | ≈ 6.4208 |
+## Quick Start
 
-*分析要点：* 三者困惑度差距在 **约 0.02（相对变化不足 0.4%）** 量级，说明当前 FP8 导出在语言建模指标上与 BF16 非常接近；W8A8 与 W8A16 的反量化 PPL 几乎相同，主要反映**权重量化**带来的差异，与「W8A8 激活量化未在 HF 评估中完全复现」的设定一致。
+```bash
+pip install -e .
+```
+
+Run MoE local compute:
+
+```bash
+python scripts/moe/moe_local_compute_bench.py --device cuda --backends eager,optimized,fused
+```
+
+Run chunked prefill:
+
+```bash
+python scripts/generation/chunked_prefill_bench.py --model-path /path/to/model --max-model-len 0
+```
+
+Run the 7B quantization stack:
+
+```bash
+python scripts/quantization/run_4090_7b_stack.py \
+  --bf16-model-path /path/to/Qwen2.5-7B-Instruct \
+  --w8a16-model-path /path/to/Qwen2.5-7B-Instruct-FP8-W8A16 \
+  --stages bf16,w8a16,kv
+```
+
+## Next Work
+
+1. Debug FP8 KV logits/token divergence on 7B.
+2. Replace or optimize the current SM89 W8A16 dequant-matmul runtime.
+3. Re-enter W8A8 only after W8A16 and FP8 KV have clean 7B gates.

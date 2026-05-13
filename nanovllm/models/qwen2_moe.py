@@ -170,6 +170,7 @@ class Qwen2MoeSparseMoeBlock(BaseSparseMoeBlock):
         ep_group: Optional[dist.ProcessGroup] = None,
         use_overlap: bool = True,
         experts_backend: str = "fused",
+        ep_backend: str = "torch",
     ) -> None:
         super().__init__(
             config,
@@ -177,6 +178,7 @@ class Qwen2MoeSparseMoeBlock(BaseSparseMoeBlock):
             ep_group=ep_group,
             renormalize_router_weights=False,
             experts_backend=experts_backend,
+            ep_backend=ep_backend,
         )
         self.use_overlap = use_overlap
         self.shared_expert_gate = nn.Linear(self.hidden_size, 1, bias=False)
@@ -228,6 +230,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         ep_group: Optional[dist.ProcessGroup] = None,
         group_gemm_enable : bool = True,
         moe_backend: str = "fused",
+        moe_ep_backend: str = "torch",
     ) -> None:
         super().__init__()
         self.self_attn = Qwen2MoeAttention(
@@ -249,6 +252,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     tp_group=tp_group,
                     ep_group=ep_group,
                     experts_backend=moe_backend,
+                    ep_backend=moe_ep_backend,
                 )
             else:
                 self.mlp = Qwen2MoeEagerSparseMoeBlock(config=config, tp_group=tp_group, ep_group=ep_group)
@@ -278,14 +282,28 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
 
 class Qwen2MoeModel(nn.Module):
-    def __init__(self, config: Qwen2MoeConfig, tp_group=None, ep_group=None, moe_backend: str = "fused") -> None:
+    def __init__(
+        self,
+        config: Qwen2MoeConfig,
+        tp_group=None,
+        ep_group=None,
+        moe_backend: str = "fused",
+        moe_ep_backend: str = "torch",
+    ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, tp_group=tp_group
         )
         self.layers = nn.ModuleList(
             [
-                Qwen2MoeDecoderLayer(config, layer_idx, tp_group, ep_group, moe_backend=moe_backend)
+                Qwen2MoeDecoderLayer(
+                    config,
+                    layer_idx,
+                    tp_group,
+                    ep_group,
+                    moe_backend=moe_backend,
+                    moe_ep_backend=moe_ep_backend,
+                )
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -315,6 +333,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         tp_group: Optional[dist.ProcessGroup] = None, 
         ep_group: Optional[dist.ProcessGroup] = None,
         moe_backend: str = "fused",
+        moe_ep_backend: str = "torch",
         **kwargs 
     ) -> None:
         super().__init__()
@@ -328,6 +347,7 @@ class Qwen2MoeForCausalLM(nn.Module):
             tp_group=self.tp_group,
             ep_group=self.ep_group,
             moe_backend=moe_backend,
+            moe_ep_backend=moe_ep_backend,
         )
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, tp_group=self.tp_group)
         

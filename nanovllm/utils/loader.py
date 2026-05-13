@@ -84,7 +84,7 @@ def load_model(model: nn.Module, path: str):
                 parts = weight_name.rsplit(".", 1)
                 base_name = weight_name
                 suffix = ""
-                # 兼容普通权重(.weight)和AWQ权重
+                # 兼容普通权重和新量化后缀
                 if len(parts) == 2 and parts[1] in [
                     "qweight",
                     "qzeros",

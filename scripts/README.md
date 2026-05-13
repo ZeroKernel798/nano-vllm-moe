@@ -1,31 +1,13 @@
-# Scripts Layout
+# Scripts
 
-This directory contains runnable utility scripts grouped by purpose.
+Only scripts for the current refactor tracks are kept.
 
-## benchmarks
-
-Performance scripts for throughput/latency experiments.
-
-- `python scripts/benchmarks/bench.py --help`
-- `python scripts/benchmarks/pd_bench.py --help`
-- `python scripts/benchmarks/ep_bench.py --help`
-- `python scripts/benchmarks/ep_tp_bench.py --help`
-
-## eval
-
-Quality evaluation scripts (e.g., perplexity).
-
-- `python scripts/eval/eval_ppl_wikitext.py --help`
-- `python scripts/eval/eval_ppl_nano_fp8.py --help`
-
-## tools
-
-Project helper tools.
-
-- `python scripts/tools/downmodel.py --help`
-
-## examples
-
-Minimal usage example scripts.
-
-- `python scripts/examples/example.py`
+| Directory | Purpose |
+| --- | --- |
+| `moe/` | MoE local compute, backend comparison, and baseline EP checks |
+| `generation/` | generation benchmarks and chunked prefill validation |
+| `quantization/` | FP8 checkpoint export, runtime benchmark, PPL/logits checks |
+| `kv_cache/` | FP8 KV cache smoke, logits tracing, and microbenchmarks |
+| `eval/` | generic evaluation helpers |
+| `examples/` | minimal runnable examples |
+| `remote/` | remote validation cleanup helpers |

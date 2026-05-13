@@ -34,13 +34,23 @@ more tolerant than decode.
 **Phase D — Decode:** Either integrate a library that supports FP8 KV + paged attention on your
 GPU, or add a **batch=1 / small-batch** Triton decode that matches GQA layout and block tables.
 
-Until Phase D is satisfied, keep ``kv_cache_dtype="bf16"`` for production inference.
+Until Phase D is satisfied, keep ``kv_cache_dtype="bf16"`` for production inference. The
+experimental FP8 path intentionally dequantizes back to BF16 before FlashAttention so it can
+verify memory accounting and accuracy without claiming decode speedups.
 """
 
 from __future__ import annotations
 
 KV_CACHE_DTYPES_BF16 = frozenset({"bf16", "bfloat16"})
 KV_CACHE_DTYPES_FP8 = frozenset({"fp8", "fp8_e4m3", "float8_e4m3fn"})
+KV_CACHE_SCALE_DTYPES = {
+    "fp32": "float32",
+    "float32": "float32",
+    "fp16": "float16",
+    "float16": "float16",
+    "bf16": "bfloat16",
+    "bfloat16": "bfloat16",
+}
 
 
 def normalize_kv_cache_dtype(name: str) -> str:
@@ -50,6 +60,22 @@ def normalize_kv_cache_dtype(name: str) -> str:
     if n in KV_CACHE_DTYPES_FP8:
         return "fp8_e4m3"
     raise ValueError(f"Unknown kv_cache_dtype: {name!r}")
+
+
+def kv_cache_scale_dtype_bytes_per_element(kv_cache_scale_dtype: str) -> int:
+    n = normalize_kv_cache_scale_dtype(kv_cache_scale_dtype)
+    if n == "float32":
+        return 4
+    if n in {"float16", "bfloat16"}:
+        return 2
+    raise AssertionError(f"Unhandled kv_cache_scale_dtype: {n}")
+
+
+def normalize_kv_cache_scale_dtype(name: str) -> str:
+    n = name.strip().lower()
+    if n in KV_CACHE_SCALE_DTYPES:
+        return KV_CACHE_SCALE_DTYPES[n]
+    raise ValueError(f"Unknown kv_cache_scale_dtype: {name!r}")
 
 
 def kv_cache_bytes_per_element(kv_cache_dtype: str) -> int:
@@ -68,10 +94,11 @@ def kv_cache_runtime_supported(kv_cache_dtype: str) -> bool:
     return n == "bf16"
 
 
-def assert_kv_cache_runtime_supported(kv_cache_dtype: str) -> None:
-    if not kv_cache_runtime_supported(kv_cache_dtype):
+def assert_kv_cache_runtime_supported(kv_cache_dtype: str, experimental_fp8: bool = False) -> None:
+    if not kv_cache_runtime_supported(kv_cache_dtype) and not experimental_fp8:
         raise NotImplementedError(
             f'kv_cache_dtype={kv_cache_dtype!r} is not implemented yet. '
-            f'Only "bf16" works with the current FlashAttention path. '
+            f'Only "bf16" is production-supported with the current FlashAttention path. '
+            f'Pass experimental_kv_cache_fp8=True to use the slow FP8-store/BF16-dequant path. '
             f'See nanovllm.utils.kv_cache module docstring for the rollout plan.'
         )

@@ -1,5 +1,6 @@
 import pickle
 import inspect
+import os
 from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.synchronize import Event
 
@@ -7,11 +8,14 @@ import torch
 import torch.distributed as dist
 
 from nanovllm.config import Config
-from nanovllm.utils.kv_cache import kv_cache_bytes_per_element, normalize_kv_cache_dtype
+from nanovllm.utils.kv_cache import kv_cache_bytes_per_element, kv_cache_scale_dtype_bytes_per_element, normalize_kv_cache_dtype
 from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.sampler import Sampler
 from nanovllm.models.models import model_dict
+from nanovllm.executor.moe.profile import get_moe_profile, reset_moe_profile
+from nanovllm.quantization import get_quant_config, process_weights_after_loading
 from nanovllm.utils.context import get_context, reset_context, set_context
+from nanovllm.utils.kv_cache_profile import get_kv_cache_profile, reset_kv_cache_profile
 from nanovllm.utils.loader import load_model
 
 
@@ -33,6 +37,7 @@ class ModelRunner:
             "nccl", "tcp://localhost:2335", world_size=self.world_size, rank=rank
         )
         torch.cuda.set_device(rank)
+        self.device = torch.device(f"cuda:{rank}")
         
         self.tp_group = None
         self.ep_group = None
@@ -63,8 +68,14 @@ class ModelRunner:
             model_kwargs["ep_group"] = self.ep_group
         if "moe_backend" in model_init_params:
             model_kwargs["moe_backend"] = config.moe_backend
+        if "moe_ep_backend" in model_init_params:
+            model_kwargs["moe_ep_backend"] = config.moe_ep_backend
+        quant_config = get_quant_config(hf_config)
+        if "quant_config" in model_init_params:
+            model_kwargs["quant_config"] = quant_config
         self.model = model_cls(hf_config, **model_kwargs)
         load_model(self.model, config.model)
+        process_weights_after_loading(self.model)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -76,16 +87,16 @@ class ModelRunner:
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                dist.barrier()
+                dist.barrier(device_ids=[rank])
             else:
-                dist.barrier()
+                dist.barrier(device_ids=[rank])
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
 
     def exit(self):
         if self.world_size > 1:
             self.shm.close()
-            dist.barrier()
+            dist.barrier(device_ids=[self.rank])
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
@@ -123,6 +134,18 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    def reset_moe_profile(self):
+        reset_moe_profile()
+
+    def get_moe_profile(self):
+        return get_moe_profile()
+
+    def reset_kv_cache_profile(self):
+        reset_kv_cache_profile()
+
+    def get_kv_cache_profile(self):
+        return get_kv_cache_profile()
+
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -130,10 +153,13 @@ class ModelRunner:
             self.config.max_num_batched_tokens,
             self.config.max_model_len,
         )
+        seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(
-            max_num_batched_tokens // max_model_len, self.config.max_num_seqs
+            max_num_batched_tokens // seq_len, self.config.max_num_seqs
         )
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
+        for seq in seqs:
+            seq.num_scheduled_tokens = seq_len
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
@@ -159,7 +185,7 @@ class ModelRunner:
             kv_bpe = hf_config.torch_dtype.itemsize
         else:
             kv_bpe = kv_cache_bytes_per_element(config.kv_cache_dtype)
-        block_bytes = (
+        kv_data_block_bytes = (
             2
             * hf_config.num_hidden_layers
             * self.block_size
@@ -167,25 +193,47 @@ class ModelRunner:
             * head_dim
             * kv_bpe
         )
+        scale_block_bytes = 0
+        if normalize_kv_cache_dtype(config.kv_cache_dtype) == "fp8_e4m3":
+            scale_block_bytes = (
+                2
+                * hf_config.num_hidden_layers
+                * self.block_size
+                * num_kv_heads
+                * kv_cache_scale_dtype_bytes_per_element(config.kv_cache_scale_dtype)
+            )
+        block_bytes = kv_data_block_bytes + scale_block_bytes
         config.num_kvcache_blocks = (
             int(total * config.gpu_memory_utilization - used - peak + current)
             // block_bytes
         )
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.zeros(
+        kv_cache_dtype = torch.float8_e4m3fn if normalize_kv_cache_dtype(config.kv_cache_dtype) == "fp8_e4m3" else hf_config.torch_dtype
+        kv_cache_shape = (
             2,
             hf_config.num_hidden_layers,
             config.num_kvcache_blocks,
             self.block_size,
             num_kv_heads,
             head_dim,
-            dtype=hf_config.torch_dtype,
         )
+        self.kv_cache = torch.empty(kv_cache_shape, dtype=kv_cache_dtype) if kv_cache_dtype == torch.float8_e4m3fn else torch.zeros(kv_cache_shape, dtype=kv_cache_dtype)
+        scale_cache_shape = (hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads)
+        if kv_cache_dtype == torch.float8_e4m3fn:
+            scale_dtype = getattr(torch, config.kv_cache_scale_dtype)
+            self.k_scale_cache = torch.empty(scale_cache_shape, dtype=scale_dtype, device="cuda")
+            self.v_scale_cache = torch.empty(scale_cache_shape, dtype=scale_dtype, device="cuda")
+        else:
+            self.k_scale_cache = self.v_scale_cache = torch.tensor([], device="cuda")
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
+                if self.k_scale_cache.numel() and hasattr(module, "k_scale_cache"):
+                    module.k_scale_cache = self.k_scale_cache[layer_id]
+                if self.v_scale_cache.numel() and hasattr(module, "v_scale_cache"):
+                    module.v_scale_cache = self.v_scale_cache[layer_id]
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
@@ -208,24 +256,29 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
-            seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens :])
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-            seqlen_q = seqlen - seq.num_cached_tokens
-            seqlen_k = seqlen
+            start = seq.num_cached_tokens
+            seqlen_q = seq.num_scheduled_tokens
+            end = start + seqlen_q
+            seqlen_k = end
+            input_ids.extend(seq[start:end])
+            positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
+            start_block = start // self.block_size
+            end_block = (end + self.block_size - 1) // self.block_size
+            for i in range(start_block, end_block):
+                slot_start = seq.block_table[i] * self.block_size
+                if i == start_block:
+                    slot_start += start % self.block_size
+                if i != end_block - 1:
+                    slot_end = seq.block_table[i] * self.block_size + self.block_size
                 else:
-                    end = start + seq.last_block_num_tokens
-                slot_mapping.extend(list(range(start, end)))
+                    slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
+                slot_mapping.extend(range(slot_start, slot_end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:  # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
@@ -332,6 +385,21 @@ class ModelRunner:
         )
         reset_context()
         return token_ids
+
+    def run_with_logits(self, seqs: list[Sequence], is_prefill: bool):
+        input_ids, positions = (
+            self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        )
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        logits = self.run_model(input_ids, positions, is_prefill)
+        if self.rank == 0:
+            token_ids = self.sampler(logits, temperatures).tolist()
+            logits_cpu = logits.detach().float().cpu()
+        else:
+            token_ids = None
+            logits_cpu = None
+        reset_context()
+        return token_ids, logits_cpu
 
     @torch.inference_mode()
     def capture_cudagraph(self):

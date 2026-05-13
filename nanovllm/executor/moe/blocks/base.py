@@ -8,16 +8,20 @@ from torch import nn
 
 from nanovllm.executor.moe.config import MoEParallelConfig, make_moe_parallel_config
 from nanovllm.executor.moe.experts import (
-    MiniSglangExperts,
+    OptimizedExperts,
     MoEExpertsKernel,
-    TransformersEagerExperts,
-    TritonGroupedGemmExperts,
+    EagerExperts,
+    FusedExperts,
 )
 from nanovllm.executor.moe.kernel import MoEKernel
-from nanovllm.executor.moe.prepare_finalize import NoEPPrepareFinalize, TorchAllToAllPrepareFinalize
+from nanovllm.executor.moe.prepare_finalize import (
+    NoEPPrepareFinalize,
+    TorchAllToAllPrepareFinalize,
+)
 from nanovllm.executor.moe.router import MoERouter, SoftmaxTopKRouter
 
-MoEBackendName = Literal["transformers", "mini_sglang", "fused"]
+MoEBackendName = Literal["eager", "optimized", "fused"]
+MoEEPBackendName = Literal["torch"]
 
 
 class BaseSparseMoeBlock(nn.Module):
@@ -29,6 +33,7 @@ class BaseSparseMoeBlock(nn.Module):
         ep_group: Optional[dist.ProcessGroup] = None,
         renormalize_router_weights: bool,
         experts_backend: MoEBackendName = "fused",
+        ep_backend: MoEEPBackendName = "torch",
         router: MoERouter | None = None,
     ) -> None:
         super().__init__()
@@ -64,26 +69,29 @@ class BaseSparseMoeBlock(nn.Module):
         self.gate.weight.weight_loader = self.load_replicated_weight
         self.router = router or SoftmaxTopKRouter(self.top_k, renormalize=renormalize_router_weights)
         self.experts_backend_name = experts_backend
+        self.ep_backend_name = ep_backend
         self.moe_kernel = MoEKernel(
-            prepare_finalize=self._make_prepare_finalize(self.parallel_config),
+            prepare_finalize=self._make_prepare_finalize(self.parallel_config, ep_backend),
             experts=self._make_experts(experts_backend),
             parallel_config=self.parallel_config,
         )
 
     @staticmethod
-    def _make_prepare_finalize(parallel_config: MoEParallelConfig):
+    def _make_prepare_finalize(parallel_config: MoEParallelConfig, ep_backend: MoEEPBackendName):
         if parallel_config.ep_size <= 1:
             return NoEPPrepareFinalize(parallel_config)
-        return TorchAllToAllPrepareFinalize(parallel_config)
+        if ep_backend == "torch":
+            return TorchAllToAllPrepareFinalize(parallel_config)
+        raise ValueError(f"Unsupported MoE EP backend: {ep_backend}")
 
     @staticmethod
     def _make_experts(experts_backend: MoEBackendName) -> MoEExpertsKernel:
-        if experts_backend == "transformers":
-            return TransformersEagerExperts()
-        if experts_backend == "mini_sglang":
-            return MiniSglangExperts()
+        if experts_backend == "eager":
+            return EagerExperts()
+        if experts_backend == "optimized":
+            return OptimizedExperts()
         if experts_backend == "fused":
-            return TritonGroupedGemmExperts()
+            return FusedExperts()
         raise ValueError(f"Unsupported MoE experts backend: {experts_backend}")
 
     def load_replicated_weight(self, param, loaded_weight, **kwargs):

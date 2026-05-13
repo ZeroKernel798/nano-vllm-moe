@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import os
+import time
+
 import torch
 
 from nanovllm.executor.moe.config import MoEParallelConfig
 from nanovllm.executor.moe.experts import MoEExpertsKernel
 from nanovllm.executor.moe.prepare_finalize import MoEPrepareFinalize
+from nanovllm.executor.moe.profile import record_moe_profile
 
 
 class MoEKernel:
@@ -32,7 +36,16 @@ class MoEKernel:
         w13_weight_scale: torch.Tensor | None = None,
         w2_weight_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        profile = os.environ.get("NANOVLLM_MOE_PROFILE", "0") == "1"
+        if profile and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start = time.perf_counter() if profile else 0.0
         prepared = self.prepare_finalize.prepare(x, topk_weights, topk_ids)
+        if profile:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            record_moe_profile("prepare", time.perf_counter() - start)
+            start = time.perf_counter()
         local_out = self.experts.apply(
             prepared.hidden_states,
             prepared.topk_ids,
@@ -46,10 +59,20 @@ class MoEKernel:
             w13_weight_scale=w13_weight_scale,
             w2_weight_scale=w2_weight_scale,
         )
-        return self.prepare_finalize.finalize(
+        if profile:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            record_moe_profile("experts", time.perf_counter() - start)
+            start = time.perf_counter()
+        output = self.prepare_finalize.finalize(
             local_out,
             prepared,
             output_shape=(x.shape[0], x.shape[1]),
             model_dtype=model_dtype,
             reduce_tp=reduce_tp,
         )
+        if profile:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            record_moe_profile("finalize", time.perf_counter() - start)
+        return output
