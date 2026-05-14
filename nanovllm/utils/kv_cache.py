@@ -43,6 +43,8 @@ from __future__ import annotations
 
 KV_CACHE_DTYPES_BF16 = frozenset({"bf16", "bfloat16"})
 KV_CACHE_DTYPES_FP8 = frozenset({"fp8", "fp8_e4m3", "float8_e4m3fn"})
+KV_CACHE_DTYPES_FP8_V_ONLY = frozenset({"fp8_v_only", "v_fp8", "v8"})
+KV_CACHE_DTYPES_K_INT8_V_FP8 = frozenset({"k_int8_v_fp8", "int8_k_fp8_v", "kv_int8_fp8"})
 KV_CACHE_SCALE_DTYPES = {
     "fp32": "float32",
     "float32": "float32",
@@ -59,6 +61,10 @@ def normalize_kv_cache_dtype(name: str) -> str:
         return "bf16"
     if n in KV_CACHE_DTYPES_FP8:
         return "fp8_e4m3"
+    if n in KV_CACHE_DTYPES_FP8_V_ONLY:
+        return "fp8_v_only"
+    if n in KV_CACHE_DTYPES_K_INT8_V_FP8:
+        return "k_int8_v_fp8"
     raise ValueError(f"Unknown kv_cache_dtype: {name!r}")
 
 
@@ -83,7 +89,7 @@ def kv_cache_bytes_per_element(kv_cache_dtype: str) -> int:
     n = normalize_kv_cache_dtype(kv_cache_dtype)
     if n == "bf16":
         return 2
-    if n == "fp8_e4m3":
+    if n in {"fp8_e4m3", "fp8_v_only", "k_int8_v_fp8"}:
         return 1
     raise AssertionError
 

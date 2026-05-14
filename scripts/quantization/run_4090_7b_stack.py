@@ -113,6 +113,8 @@ def kv_cmd(args: argparse.Namespace, model_path: str, label: str, output_json: P
         str(max(input_len + args.kv_output_len, args.max_model_len)),
         "--gpu-memory-utilization",
         str(args.gpu_memory_utilization),
+        "--kv-cache-dtype",
+        args.kv_cache_dtype,
         "--fp8-decode-backend",
         args.fp8_decode_backend,
         "--native-block-tokens",
@@ -147,6 +149,7 @@ def main() -> None:
     parser.add_argument("--compare-max-new-tokens", type=int, default=8)
     parser.add_argument("--kv-input-lens", default="8192,16384,32512")
     parser.add_argument("--kv-output-len", type=int, default=16)
+    parser.add_argument("--kv-cache-dtype", default="k_int8_v_fp8", choices=("fp8_e4m3", "fp8_v_only", "k_int8_v_fp8"))
     parser.add_argument("--fp8-decode-backend", default="native", choices=("native", "gather_dequant", "full_dequant"))
     parser.add_argument("--native-block-tokens", type=int, default=64, choices=(16, 32, 64))
     parser.add_argument("--kv-cache-scale-dtype", default="float16", choices=("float16", "bfloat16", "float32"))
@@ -173,7 +176,7 @@ def main() -> None:
         )
     if "kv" in stages:
         for input_len in [int(item) for item in args.kv_input_lens.split(",") if item.strip()]:
-            name = f"w8a16_fp8kv_{input_len}"
+            name = f"w8a16_{args.kv_cache_dtype}_{input_len}"
             status_codes[name] = run_step(
                 name,
                 kv_cmd(args, args.w8a16_model_path, name, output_dir / f"{name}.json", input_len),

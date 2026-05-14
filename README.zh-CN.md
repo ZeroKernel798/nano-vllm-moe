@@ -2,7 +2,7 @@
 
 Nano-vLLM-MoE 是一个轻量 vLLM-style 推理实验项目。当前只保留三条主线：
 
-1. **MoE runtime 重构**：router、prepare/finalize、expert compute、MoE block 解耦。
+1. **MoE runtime**：模块化 router、prepare/finalize 和 expert backend，用于本地与基础 EP 实验。
 2. **Chunked prefill**：scheduler 和 sequence 支持 partial prefill，并保留 `prefill_first` / `decode_first` 两种策略。
 3. **量化重构**：当前按 RTX 4090 / 7B 主线推进：BF16 baseline -> W8A16 -> FP8 KV cache -> W8A8。
 
@@ -88,6 +88,23 @@ W8A16 checkpoint contract 健康（`196` 个 qweight tensor 和 `196` 个 weight
 
 FP8 KV 显著降低 KV storage，但 token match 还不合格。下一步先做 logits divergence debug，不能直接把 FP8 KV 作为默认路径。
 
+2026-05-14 backend isolation 更新：7B W8A16 在 `input=512, output=8` 下，`gather_dequant` 和 `full_dequant` 完全一致，但二者相对 BF16 的生成 token match 仍只有 `0.25`；KV scale cache 从 float16 改成 float32 也不能修复。因此下一步应重点查 FP8 KV storage quantization 本身，而不是只查 native paged attention kernel。
+
+2026-05-14 K/V sensitivity 更新：7B 发散来自 K cache FP8 量化。新增实验性 K-BF16/V-FP8 模式，在 512-token 和 8K-token prompt 上都保持 exact token match，同时 KV bytes/block 降到 BF16 的 `75.39%`，因此当前安全方向是 V-only FP8。
+
+K quantization probe：FP8 K 仍不稳定；fake symmetric int8 K 在 vector 或 16/32/64 group 下都能在 7B 512-token probe 上保持 exact tokens。下一步压缩方向应是 K-int8/V-FP8，而不是 K-FP8/V-FP8。
+
+K-int8/V-FP8 mixed KV 已在 7B W8A16 的 512/8K/16K token-match gate 上通过，per-block KV bytes 降到 BF16 的 `51.95%`（含 scale）。当前优化路径使用 Triton fused mixed-KV store 和 native mixed paged decode；512 短上下文 decode 仍慢于 BF16，但长上下文 decode 已有明确收益。
+
+| Prompt | Backend | Exact tokens | Logits cosine | Model TPS | 相对 BF16 加速 | KV bytes/block vs BF16 | KV blocks vs BF16 |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 8192 | BF16 KV | reference | reference | 4.34 | 1.00x | 1.0000 | 1.00x |
+| 8192 | K-int8/V-FP8 native | yes | 0.99989 | 14.64 | 3.37x | 0.5195 | 1.56x |
+| 16384 | BF16 KV | reference | reference | 4.11 | 1.00x | 1.0000 | 1.00x |
+| 16384 | K-int8/V-FP8 native | yes | 0.99987 | 10.77 | 2.62x | 0.5195 | 1.57x |
+| 32512 | BF16 KV | reference | reference | 4.03 | 1.00x | 1.0000 | 1.00x |
+| 32512 | K-int8/V-FP8 native | yes | 0.99986 | 6.43 | 1.59x | 0.5195 | 1.53x |
+
 ## 仓库结构
 
 | Path | 用途 |
@@ -131,6 +148,6 @@ python scripts/quantization/run_4090_7b_stack.py \
 
 ## 下一步
 
-1. Debug 7B FP8 KV logits/token divergence。
+1. 扩大 native K-int8/V-FP8 到 16K/32K 和更多 seeds，并增加短上下文 backend cutoff。
 2. 优化或替换当前 SM89 W8A16 dequant-matmul runtime。
 3. W8A16 和 FP8 KV gate 清楚后，再重新进入 W8A8。

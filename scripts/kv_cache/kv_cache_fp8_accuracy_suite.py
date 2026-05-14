@@ -97,7 +97,7 @@ def _run_trace(args: argparse.Namespace, prompt_token_ids: list[int], kv_cache_d
             token_ids, sample_ms = _timed_cuda(lambda: llm.model_runner.sampler(logits, temperatures).tolist())
             logits_trace.append(logits[-len(seqs) :].detach().float().cpu())
             generated.extend(int(token_id) for token_id in token_ids)
-            llm.scheduler.postprocess(seqs, token_ids)
+            llm.scheduler.postprocess(seqs, token_ids, is_prefill)
             reset_context()
             steps.append(
                 {
@@ -114,6 +114,8 @@ def _run_trace(args: argparse.Namespace, prompt_token_ids: list[int], kv_cache_d
         profile = llm.model_runner.call("get_kv_cache_profile")
         num_blocks = int(llm.model_runner.config.num_kvcache_blocks)
         kv_data_bytes = _cache_bytes(llm.model_runner.kv_cache)
+        if not kv_data_bytes:
+            kv_data_bytes = _cache_bytes(llm.model_runner.k_cache_storage) + _cache_bytes(llm.model_runner.v_cache_storage)
         scale_bytes = _cache_bytes(llm.model_runner.k_scale_cache) + _cache_bytes(llm.model_runner.v_scale_cache)
         return {
             "kv_cache_dtype": kv_cache_dtype,
@@ -231,6 +233,7 @@ def main() -> None:
     parser.add_argument("--max-model-len", type=int, default=2304)
     parser.add_argument("--max-num-batched-tokens", type=int, default=2304)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
+    parser.add_argument("--kv-cache-dtype", default="fp8_e4m3", choices=("fp8_e4m3", "fp8_v_only", "k_int8_v_fp8"))
     parser.add_argument("--kv-cache-scale-dtype", default="float16", choices=("float16", "bfloat16", "float32"))
     parser.add_argument("--fp8-decode-backend", default="native", choices=("native", "gather_dequant", "full_dequant"))
     parser.add_argument("--native-block-tokens", type=int, default=64, choices=(16, 32, 64))
@@ -251,8 +254,8 @@ def main() -> None:
         for prompt_id in prompt_ids:
             prompt = _make_prompt(seed, prompt_id, args.input_len, args.vocab_range)
             bf16 = _run_trace(args, prompt, "bf16", False)
-            fp8 = _run_trace(args, prompt, "fp8_e4m3", True)
-            comparison = _compare(bf16, fp8, args.top_k)
+            quant = _run_trace(args, prompt, args.kv_cache_dtype, True)
+            comparison = _compare(bf16, quant, args.top_k)
             record = {
                 "seed": seed,
                 "prompt_id": prompt_id,
@@ -260,9 +263,9 @@ def main() -> None:
                 "output_len": args.output_len,
                 "comparison": comparison,
                 "bf16_decode": _decode_summary(bf16),
-                "fp8_decode": _decode_summary(fp8),
+                "quant_decode": _decode_summary(quant),
                 "bf16": _strip(bf16),
-                "fp8_e4m3": _strip(fp8),
+                args.kv_cache_dtype: _strip(quant),
             }
             records.append(record)
             (output_dir / f"case_seed{seed}_prompt{prompt_id}.json").write_text(
@@ -285,6 +288,7 @@ def main() -> None:
         "output_len": args.output_len,
         "seeds": seeds,
         "prompt_ids": prompt_ids,
+        "kv_cache_dtype": args.kv_cache_dtype,
         "fp8_decode_backend": args.fp8_decode_backend,
         "native_block_tokens": args.native_block_tokens,
         "exact_match_rate": sum(1 for record in records if record["comparison"]["exact_match"]) / max(len(records), 1),
@@ -297,7 +301,10 @@ def main() -> None:
         "pre_divergence_top_k_overlap_mean": avg(["comparison", "pre_divergence_top_k_overlap_mean"]),
         "pre_divergence_argmax_match_rate_mean": avg(["comparison", "pre_divergence_argmax_match_rate"]),
         "bf16_model_tps_mean": avg(["bf16_decode", "model_tps"]),
-        "fp8_model_tps_mean": avg(["fp8_decode", "model_tps"]),
+        "quant_model_tps_mean": avg(["quant_decode", "model_tps"]),
+        "model_tps_ratio_quant_over_bf16": avg(["quant_decode", "model_tps"]) / max(avg(["bf16_decode", "model_tps"]), 1.0e-9),
+        "total_bytes_per_block_ratio_quant_over_bf16": avg([args.kv_cache_dtype, "kv_cache_total_bytes_per_block"]) / max(avg(["bf16", "kv_cache_total_bytes_per_block"]), 1.0e-9),
+        "block_ratio_quant_over_bf16": avg([args.kv_cache_dtype, "num_kvcache_blocks"]) / max(avg(["bf16", "num_kvcache_blocks"]), 1.0e-9),
         "records": records,
     }
     text = json.dumps(summary, indent=2, ensure_ascii=False)

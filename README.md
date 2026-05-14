@@ -2,7 +2,7 @@
 
 Nano-vLLM-MoE is a compact vLLM-style inference playground focused on three current tracks:
 
-1. **MoE runtime refactor**: router, prepare/finalize, expert compute, and MoE block are separated so each part can be tested independently.
+1. **MoE runtime**: modular router, prepare/finalize, and expert backends for local and baseline EP experiments.
 2. **Chunked prefill**: scheduler and sequence state support partial prefill, with `prefill_first` and `decode_first` policies.
 3. **Quantization refactor**: the active line is RTX 4090 / 7B first: BF16 baseline -> W8A16 -> FP8 KV cache -> W8A8.
 
@@ -90,6 +90,23 @@ Same 7B W8A16 checkpoint, `output=16`, native FP8 paged decode, BF16 KV referenc
 
 FP8 KV clearly reduces KV storage, but token match is not acceptable yet. The next task is logits-divergence debugging before FP8 KV can become a default mode.
 
+2026-05-14 backend isolation update: on 7B W8A16 with `input=512, output=8`, `gather_dequant` and `full_dequant` are identical, but both still match only `0.25` of BF16 generated tokens; changing KV scale cache from float16 to float32 does not fix it. This points the next investigation at FP8 KV storage quantization itself, not just the native paged attention kernel.
+
+2026-05-14 K/V sensitivity update: 7B divergence is caused by FP8 K cache quantization. A new experimental K-BF16/V-FP8 mode keeps exact token match on 512-token and 8K-token prompts while reducing KV bytes per block to `75.39%` of BF16, so V-only FP8 is the current safe KV-memory direction.
+
+K quantization probe: FP8 K remains unstable, while fake symmetric int8 K with vector or 16/32/64-wide groups keeps exact tokens on the 7B 512-token probe. The next compression target is K-int8/V-FP8 rather than K-FP8/V-FP8.
+
+K-int8/V-FP8 mixed KV now passes the 512/8K/16K token-match gate on 7B W8A16, with per-block KV bytes reduced to `51.95%` of BF16 including scales. The current optimized path uses a Triton fused mixed-KV store and native mixed paged decode; short 512-token decode is still slower than BF16, but long-context decode has clear wins.
+
+| Prompt | Backend | Exact tokens | Logits cosine | Model TPS | Speedup vs BF16 | KV bytes/block vs BF16 | KV blocks vs BF16 |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 8192 | BF16 KV | reference | reference | 4.34 | 1.00x | 1.0000 | 1.00x |
+| 8192 | K-int8/V-FP8 native | yes | 0.99989 | 14.64 | 3.37x | 0.5195 | 1.56x |
+| 16384 | BF16 KV | reference | reference | 4.11 | 1.00x | 1.0000 | 1.00x |
+| 16384 | K-int8/V-FP8 native | yes | 0.99987 | 10.77 | 2.62x | 0.5195 | 1.57x |
+| 32512 | BF16 KV | reference | reference | 4.03 | 1.00x | 1.0000 | 1.00x |
+| 32512 | K-int8/V-FP8 native | yes | 0.99986 | 6.43 | 1.59x | 0.5195 | 1.53x |
+
 ## Repository Map
 
 | Path | Purpose |
@@ -133,6 +150,6 @@ python scripts/quantization/run_4090_7b_stack.py \
 
 ## Next Work
 
-1. Debug FP8 KV logits/token divergence on 7B.
+1. Broaden native K-int8/V-FP8 gates to 16K/32K and more seeds, then add a short-context backend cutoff.
 2. Replace or optimize the current SM89 W8A16 dequant-matmul runtime.
 3. Re-enter W8A8 only after W8A16 and FP8 KV have clean 7B gates.

@@ -180,23 +180,47 @@ class ModelRunner:
             if hasattr(hf_config, "head_dim")
             else hf_config.hidden_size // hf_config.num_attention_heads
         )
-        # FP8 path (not enabled yet): 1 byte; BF16/FP16 path: match model weight/activation dtype size.
-        if normalize_kv_cache_dtype(config.kv_cache_dtype) == "bf16":
-            kv_bpe = hf_config.torch_dtype.itemsize
+        kv_cache_dtype_name = normalize_kv_cache_dtype(config.kv_cache_dtype)
+        if kv_cache_dtype_name == "bf16":
+            kv_data_bpe = 2 * hf_config.torch_dtype.itemsize
+            scale_count = 0
+        elif kv_cache_dtype_name == "fp8_e4m3":
+            kv_data_bpe = 2 * kv_cache_bytes_per_element(config.kv_cache_dtype)
+            scale_count = 2
+        elif kv_cache_dtype_name == "fp8_v_only":
+            kv_data_bpe = hf_config.torch_dtype.itemsize + kv_cache_bytes_per_element(config.kv_cache_dtype)
+            scale_bpe = kv_cache_scale_dtype_bytes_per_element(config.kv_cache_scale_dtype)
+            scale_block_bytes = (
+                hf_config.num_hidden_layers
+                * self.block_size
+                * num_kv_heads
+                * scale_bpe
+            )
+        elif kv_cache_dtype_name == "k_int8_v_fp8":
+            kv_data_bpe = 2
+            scale_bpe = kv_cache_scale_dtype_bytes_per_element(config.kv_cache_scale_dtype)
+            k_group_size = 32
+            scale_block_bytes = (
+                hf_config.num_hidden_layers
+                * self.block_size
+                * num_kv_heads
+                * (head_dim // k_group_size + 1)
+                * scale_bpe
+            )
         else:
-            kv_bpe = kv_cache_bytes_per_element(config.kv_cache_dtype)
+            raise AssertionError(f"Unhandled kv_cache_dtype={config.kv_cache_dtype!r}")
         kv_data_block_bytes = (
-            2
-            * hf_config.num_hidden_layers
+            hf_config.num_hidden_layers
             * self.block_size
             * num_kv_heads
             * head_dim
-            * kv_bpe
+            * kv_data_bpe
         )
-        scale_block_bytes = 0
-        if normalize_kv_cache_dtype(config.kv_cache_dtype) == "fp8_e4m3":
+        if kv_cache_dtype_name in {"bf16", "fp8_e4m3"}:
+            scale_block_bytes = 0
+            scale_count = 2 if kv_cache_dtype_name == "fp8_e4m3" else 0
             scale_block_bytes = (
-                2
+                scale_count
                 * hf_config.num_hidden_layers
                 * self.block_size
                 * num_kv_heads
@@ -208,28 +232,48 @@ class ModelRunner:
             // block_bytes
         )
         assert config.num_kvcache_blocks > 0
-        kv_cache_dtype = torch.float8_e4m3fn if normalize_kv_cache_dtype(config.kv_cache_dtype) == "fp8_e4m3" else hf_config.torch_dtype
-        kv_cache_shape = (
-            2,
+        cache_shape = (
             hf_config.num_hidden_layers,
             config.num_kvcache_blocks,
             self.block_size,
             num_kv_heads,
             head_dim,
         )
-        self.kv_cache = torch.empty(kv_cache_shape, dtype=kv_cache_dtype) if kv_cache_dtype == torch.float8_e4m3fn else torch.zeros(kv_cache_shape, dtype=kv_cache_dtype)
         scale_cache_shape = (hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads)
-        if kv_cache_dtype == torch.float8_e4m3fn:
+        if kv_cache_dtype_name == "fp8_v_only":
+            self.k_cache_storage = torch.zeros(cache_shape, dtype=hf_config.torch_dtype, device="cuda")
+            self.v_cache_storage = torch.empty(cache_shape, dtype=torch.float8_e4m3fn, device="cuda")
+            self.kv_cache = torch.tensor([], device="cuda")
+            self.k_scale_cache = torch.tensor([], device="cuda")
             scale_dtype = getattr(torch, config.kv_cache_scale_dtype)
-            self.k_scale_cache = torch.empty(scale_cache_shape, dtype=scale_dtype, device="cuda")
+            self.v_scale_cache = torch.empty(scale_cache_shape, dtype=scale_dtype, device="cuda")
+        elif kv_cache_dtype_name == "k_int8_v_fp8":
+            self.k_cache_storage = torch.empty(cache_shape, dtype=torch.int8, device="cuda")
+            self.v_cache_storage = torch.empty(cache_shape, dtype=torch.float8_e4m3fn, device="cuda")
+            self.kv_cache = torch.tensor([], device="cuda")
+            scale_dtype = getattr(torch, config.kv_cache_scale_dtype)
+            k_group_size = 32
+            self.k_scale_cache = torch.empty(
+                (*scale_cache_shape, head_dim // k_group_size), dtype=scale_dtype, device="cuda"
+            )
             self.v_scale_cache = torch.empty(scale_cache_shape, dtype=scale_dtype, device="cuda")
         else:
-            self.k_scale_cache = self.v_scale_cache = torch.tensor([], device="cuda")
+            kv_cache_dtype = torch.float8_e4m3fn if kv_cache_dtype_name == "fp8_e4m3" else hf_config.torch_dtype
+            kv_cache_shape = (2, *cache_shape)
+            self.kv_cache = torch.empty(kv_cache_shape, dtype=kv_cache_dtype, device="cuda") if kv_cache_dtype == torch.float8_e4m3fn else torch.zeros(kv_cache_shape, dtype=kv_cache_dtype, device="cuda")
+            self.k_cache_storage = self.kv_cache[0]
+            self.v_cache_storage = self.kv_cache[1]
+            if kv_cache_dtype == torch.float8_e4m3fn:
+                scale_dtype = getattr(torch, config.kv_cache_scale_dtype)
+                self.k_scale_cache = torch.empty(scale_cache_shape, dtype=scale_dtype, device="cuda")
+                self.v_scale_cache = torch.empty(scale_cache_shape, dtype=scale_dtype, device="cuda")
+            else:
+                self.k_scale_cache = self.v_scale_cache = torch.tensor([], device="cuda")
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
+                module.k_cache = self.k_cache_storage[layer_id]
+                module.v_cache = self.v_cache_storage[layer_id]
                 if self.k_scale_cache.numel() and hasattr(module, "k_scale_cache"):
                     module.k_scale_cache = self.k_scale_cache[layer_id]
                 if self.v_scale_cache.numel() and hasattr(module, "v_scale_cache"):

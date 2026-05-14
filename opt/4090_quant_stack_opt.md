@@ -181,3 +181,214 @@ Storage conclusion: FP8 KV total storage ratio is `26.1%` of BF16 at 8K and `18.
 ### Documentation Sync
 
 Updated `README.md` and `README.zh-CN.md` with the 7B result tables and current conclusion. Updated `todo.md` to make 7B the active quantization target and to record the FP8 KV quality/32K blockers.
+
+## 2026-05-14 Route Review
+
+### Current State
+
+The staged 4090 route is still the right order: BF16 baseline -> W8A16 -> W8A16 + FP8 KV -> W8A8. BF16 and W8A16 already have 7B evidence under `.remote-logs/quantization/4090_7b_stack_20260513/`. W8A16 is quality-stable enough to keep as the balanced checkpoint target, but it is not a speed win on RTX 4090 because SM89 falls back to per-forward BF16 dequant matmul. FP8 KV has strong storage evidence at 8K/16K but fails the quality gate because generated token match is only `1/16` and `2/16`.
+
+### Implementation Hooks
+
+- W8A16/W8A8 runtime is centered in `nanovllm/quantization/fp8.py` and `nanovllm/quantization/kernels/fp8.py`.
+- W8A16 on SM89 currently selects `w8a16_dequant_matmul`; the Triton weight-only path is only selected for capability >= 9.0.
+- W8A8 static already has a checkpoint contract with `input_scale`, `qweight_scaled_mm`, `weight_scale_scaled_mm`, activation quant backends, and `torch._scaled_mm` path.
+- FP8 KV cache is centered in `nanovllm/layers/attention.py`, `nanovllm/layers/kv_cache_kernels.py`, and `nanovllm/layers/fp8_paged_attention.py`.
+- The 7B orchestration entrypoint remains `scripts/quantization/run_4090_7b_stack.py`; targeted KV debug uses `scripts/kv_cache/kv_cache_fp8_logits.py`, `kv_cache_fp8_accuracy_suite.py`, and `fp8_paged_attention_microbench.py`.
+
+### Next Execution Order
+
+1. Reproduce FP8 KV divergence with a small deterministic logits trace and compare native paged decode against gather-dequant/full-dequant, so the bug is isolated to store scales, native attention math, or FP8 precision itself.
+2. If gather/full dequant matches BF16 better than native, fix `fp8_paged_attention.py`; if all FP8 paths diverge similarly, inspect scale granularity and store quantization in `kv_cache_kernels.py`.
+3. Add a FP8-only 32K capacity mode or chunked-prefill capacity script so long-context capacity can be measured without the BF16 reference path OOMing first.
+4. In parallel after KV correctness is understood, evaluate an SM89 W8A16 speed improvement: either enable/retune a Triton weight-only kernel for SM89 or cache/dequant weights once at load time for a speed baseline, while preserving the memory-mode checkpoint result separately.
+5. Only after W8A16 + FP8 KV has a bounded quality story, run W8A8 static export and `fp8_linear_microbench.py` across representative Qwen2.5-7B linear shapes; promote W8A8 only for shapes where full activation-quant + scaled-mm time beats BF16/W8A16.
+
+### Decision
+
+Do not jump directly to full W8A8 serving. The immediate blocker for the full route is FP8 KV quality, followed by SM89 W8A16 runtime speed. W8A8 is implemented enough for profiling, but should remain experimental until the balanced and long-context stages have defensible gates.
+
+## 2026-05-14 FP8 KV Backend Isolation
+
+### Scope
+
+Extended `scripts/kv_cache/kv_cache_fp8_logits.py` so one run can compare FP8 KV decode backends against BF16 and against each other. The backends are:
+
+- `native`: custom FP8 paged attention reads FP8 KV directly.
+- `gather_dequant`: gather only decode-visible FP8 KV tokens, dequantize them, then call FlashAttention.
+- `full_dequant`: dequantize the full FP8 cache, then call FlashAttention.
+
+Added `--isolated-runs` because Qwen2.5-7B W8A16 OOMs when BF16 and all FP8 variants are loaded sequentially in one process.
+
+### Remote Evidence
+
+- Environment: `.remote-logs/kv_debug_20260514/env.log`
+- 0.5B script smoke: `.remote-logs/kv_debug_20260514/0p5b_len256_all_backends_retry.json`
+- 7B W8A16 float16 scale: `.remote-logs/kv_debug_20260514/7b_w8a16_len512_all_backends_isolated.json`
+- 7B W8A16 float32 scale: `.remote-logs/kv_debug_20260514/7b_w8a16_len512_float32scale.json`
+- Failed non-isolated 7B attempt: `.remote-logs/kv_debug_20260514/7b_w8a16_len512_all_backends.log` failed with CUDA OOM during repeated model loads.
+
+### Result
+
+0.5B smoke passed: all three FP8 backends matched BF16 tokens for `input_len=256`, `output_len=4`; `gather_dequant` and `full_dequant` were bitwise identical in logits (`max_abs=0.0`).
+
+7B W8A16 at `input_len=512`, `output_len=8`, `max_model_len=1024`, `gpu_memory_utilization=0.9` reproduced the divergence at small scale:
+
+| Scale dtype | Backend | Token match vs BF16 | First mismatch | Argmax match | Cosine mean | Top-k overlap | Max abs |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| float16 | native | 0.25 | 2 | 0.25 | 0.6990 | 0.4500 | 25.1875 |
+| float16 | gather_dequant | 0.25 | 2 | 0.25 | 0.6960 | 0.4625 | 25.4375 |
+| float16 | full_dequant | 0.25 | 2 | 0.25 | 0.6960 | 0.4625 | 25.4375 |
+| float32 | gather_dequant | 0.25 | 2 | 0.25 | 0.6901 | 0.4938 | 25.0625 |
+| float32 | full_dequant | 0.25 | 2 | 0.25 | 0.6901 | 0.4938 | 25.0625 |
+
+Pairwise result: `gather_dequant` and `full_dequant` are identical on 7B (`token_match=1.0`, `argmax_match=1.0`, `max_abs=0.0`) for both float16 and float32 scale caches. `native` differs from gather/full, but the major BF16-vs-FP8 divergence is already present in gather/full.
+
+### Conclusion
+
+The primary 7B quality problem is not the gather workspace, full-cache dequant path, or scale-cache dtype. It is also not solely the native paged attention kernel, although native has extra drift versus gather/full. The next debugging target should be FP8 KV storage quantization itself: scale granularity, E4M3 saturation/underflow, K vs V sensitivity, and whether long-context 7B needs a less aggressive scheme such as per-vector/per-channel scale variants or selective BF16 K/V retention.
+
+## 2026-05-14 K/V Sensitivity And V-only FP8 Fix
+
+### Scope
+
+Added a BF16-cache fake FP8 store mode to isolate whether K or V quantization causes the 7B divergence, then added an experimental real `kv_cache_dtype="fp8_v_only"` path that stores K in BF16 and V in FP8 E4M3 with per-token/per-head V scale.
+
+### Remote Evidence
+
+- K/V fake FP8 ablation: `.remote-logs/kv_debug_20260514/7b_fake_fp8_kv_ablation_retry.json`
+- Real V-only FP8, 512 prompt: `.remote-logs/kv_debug_20260514/7b_v_fp8_real.json`
+- Real V-only FP8, 8K prompt: `.remote-logs/kv_debug_20260514/7b_v_fp8_len8192.json`
+
+### Result
+
+| Mode | Prompt | Token match | Argmax match | Cosine mean | Top-k overlap | Max abs | KV bytes/block vs BF16 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| fake K-only FP8 | 512 | 0.25 | 0.25 | 0.6914 | 0.4688 | 25.0 | n/a |
+| fake V-only FP8 | 512 | 1.00 | 1.00 | 0.99994 | 0.9938 | 0.25 | n/a |
+| fake K+V FP8 | 512 | 0.25 | 0.25 | 0.6912 | 0.4625 | 25.0625 | n/a |
+| real V-only FP8 | 512 | 1.00 | 1.00 | 0.99992 | 0.9938 | 0.25 | 0.7539 |
+| real V-only FP8 | 8192 | 1.00 | 1.00 | 0.99996 | 0.9813 | 0.1875 | 0.7539 |
+
+### Conclusion
+
+The 7B divergence is driven by FP8 K cache quantization. V cache is much more tolerant: real K-BF16/V-FP8 keeps exact generated-token match on the tested 512 and 8K prompts while reducing per-block KV storage to `75.39%` of BF16 including scale overhead, and increasing available KV block count by about `1.33x`. Treat V-only FP8 as the current safe long-context direction; keep full K+V FP8 experimental until a better K quantization scheme is found.
+
+## 2026-05-14 V-only Suite And K Quantization Probe
+
+### V-only Suite Integration
+
+`kv_cache_fp8_smoke.py` now accepts `--kv-cache-dtype fp8_v_only`, and `run_4090_7b_stack.py` defaults the KV stage to `fp8_v_only`. This makes the validated K-BF16/V-FP8 path the suite default while full K+V FP8 remains selectable with `--kv-cache-dtype fp8_e4m3`.
+
+Remote evidence: `.remote-logs/kv_debug_20260514/v_only_suite_8k16k/`.
+
+| Prompt | Token match | Exact | V-only prefill TPS | V-only decode TPS | Total bytes/block vs BF16 | Block ratio vs BF16 |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| 8192 | 1.00 | yes | 10008.1 | 11.11 | 0.7539 | 0.3465 |
+| 16384 | 1.00 | yes | 9249.1 | 12.14 | 0.7539 | 0.2391 |
+
+The storage ratios in these smoke outputs are affected by different allocated block counts between BF16 reference and quantized runs; the stable per-block conclusion is that K-BF16/V-FP8 uses `75.39%` of BF16 KV bytes per block including V scales.
+
+### K Quantization Probe
+
+Added fake K quantization knobs to `kv_cache_fp8_logits.py`: `--fake-fp8-format {e4m3,e5m2,int8}` and `--fake-fp8-group-size`. This keeps the BF16 cache path but round-trips K through candidate quantizers before storage, so it isolates K quantization quality without implementing a full K quantized cache yet.
+
+Remote evidence: `.remote-logs/kv_debug_20260514/k_ablation/`.
+
+| K quant | Group | Token match | Exact | Argmax match | Cosine mean | Top-k overlap | Max abs |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| E4M3 | vector | 0.25 | no | 0.25 | 0.6914 | 0.4688 | 25.0 |
+| E4M3 | 16 | 0.625 | no | 0.625 | 0.9295 | 0.7688 | 22.1719 |
+| E4M3 | 32 | 0.625 | no | 0.625 | 0.9331 | 0.7625 | 22.2188 |
+| E4M3 | 64 | 0.625 | no | 0.625 | 0.9324 | 0.7625 | 22.1875 |
+| E5M2 | vector | 0.75 | no | 0.75 | 0.9164 | 0.7000 | 21.8906 |
+| E5M2 | 16 | 0.375 | no | 0.375 | 0.6760 | 0.5438 | 29.5156 |
+| E5M2 | 32 | 0.375 | no | 0.375 | 0.7917 | 0.5625 | 23.8750 |
+| E5M2 | 64 | 0.375 | no | 0.375 | 0.6623 | 0.5312 | 29.2656 |
+| int8 | vector | 1.00 | yes | 1.00 | 0.9987 | 0.9875 | 1.9375 |
+| int8 | 16 | 1.00 | yes | 1.00 | 0.9998 | 1.0000 | 0.5000 |
+| int8 | 32 | 1.00 | yes | 1.00 | 0.9998 | 1.0000 | 0.5000 |
+| int8 | 64 | 1.00 | yes | 1.00 | 0.9996 | 0.9875 | 0.8438 |
+
+### Decision
+
+K should not use the current FP8 E4M3 storage. E4M3 group scaling improves logits but still misses tokens, and E5M2 is not consistently better. Symmetric int8 K with group size 16 or 32 is the first promising K compression direction. The next implementation target is a hybrid K-int8/V-FP8 cache, likely with per-token/per-head/per-group K scale and the existing V-FP8 path.
+
+## 2026-05-14 K-int8/V-FP8 Mixed KV Gate
+
+### Scope
+
+Implemented experimental `kv_cache_dtype="k_int8_v_fp8"`: K is stored as symmetric int8 with per-token/per-head/group-32 scale, V is stored as FP8 E4M3 with per-token/per-head scale. Decode currently dequantizes the full mixed cache back to BF16 before FlashAttention, so this is a precision/capacity gate rather than the final optimized performance path.
+
+### Remote Evidence
+
+- Root: `.remote-logs/kv_debug_20260514/k_int8_v_fp8/`
+- 512 prompt: `.remote-logs/kv_debug_20260514/k_int8_v_fp8/512.json`
+- 8K prompt: `.remote-logs/kv_debug_20260514/k_int8_v_fp8/8192.json`
+- 16K prompt: `.remote-logs/kv_debug_20260514/k_int8_v_fp8/16384.json`
+
+### Result
+
+| Prompt | Token match | Exact | Mixed prefill TPS | Mixed decode TPS | Wall time | Total bytes/block vs BF16 | Block ratio vs BF16 |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 512 | 1.00 | yes | 4527.3 | 6.66 | 2.37 s | 0.5195 | 0.6096 |
+| 8192 | 1.00 | yes | 9931.0 | 7.49 | 2.83 s | 0.5195 | 0.5105 |
+| 16384 | 1.00 | yes | 9241.9 | 9.14 | 3.41 s | 0.5195 | 0.3525 |
+
+### Conclusion
+
+The mixed KV precision gate passes on the tested 512/8K/16K prompts. Compared with BF16 KV, K-int8/V-FP8 reduces per-block KV bytes to `51.95%` including K/V scales while keeping exact generated tokens in these probes. This should become the main KV compression track. Performance is not final because the current decode path still full-dequantizes mixed KV before FlashAttention; optimized mixed-KV attention can be addressed after precision gates are broader.
+
+## 2026-05-14 Mixed KV Capacity And Native Decode Optimization
+
+### Scope
+
+Fixed mixed KV capacity accounting, parameterized the logits accuracy suite with `--kv-cache-dtype k_int8_v_fp8`, added a Triton fused store kernel for K-int8/V-FP8, and added a decode-only native paged attention kernel that reads int8 K + FP8 V directly with scales. Baselines are preserved with `NANOVLLM_K_INT8_V_FP8_STORE=torch` and `--fp8-decode-backend gather_dequant/full_dequant`.
+
+### Remote Evidence
+
+- Root: `.remote-logs/kv_mixed_opt_20260514/`
+- 7B full-dequant baseline attempt: `.remote-logs/kv_mixed_opt_20260514/7b_full_dequant_len512.log` failed with CUDA OOM at `gpu_memory_utilization=0.92` because full-cache BF16 dequant needs an additional full KV buffer.
+- 512 gather baseline: `.remote-logs/kv_mixed_opt_20260514/7b_gather_dequant_len512/summary.json`
+- 512 Triton store + gather: `.remote-logs/kv_mixed_opt_20260514/7b_gather_store_triton_len512/summary.json`
+- 512 Triton store + native: `.remote-logs/kv_mixed_opt_20260514/7b_native_store_triton_len512/summary.json`
+- 8K Triton store + gather: `.remote-logs/kv_mixed_opt_20260514/7b_gather_store_triton_len8192/summary.json`
+- 8K Triton store + native: `.remote-logs/kv_mixed_opt_20260514/7b_native_store_triton_len8192/summary.json`
+
+### Result
+
+| Prompt | Backend | Exact | Cosine mean | Quant/BF16 model TPS | Native/gather profile | Store profile | Bytes/block vs BF16 | Block ratio |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | gather + torch store | yes | 0.99928 | 0.668x | gather `5.00 ms` | torch store `0.49 ms` | 0.5195 | 2.06x |
+| 512 | gather + Triton store | yes | 0.99848 | 0.870x | gather `4.90 ms` | Triton store `0.43 ms` | 0.5195 | 1.40x |
+| 512 | native + Triton store | yes | 0.99839 | 0.796x | native `5.54 ms` | Triton store `0.12 ms` | 0.5195 | 1.40x |
+| 8192 | gather + Triton store | yes | 0.99990 | 1.114x | gather `4.99 ms` | Triton store `0.15 ms` | 0.5195 | 1.57x |
+| 8192 | native + Triton store | yes | 0.99989 | 3.372x | native `0.81 ms` | Triton store `0.13 ms` | 0.5195 | 1.56x |
+
+### Conclusion
+
+The optimized path keeps exact generated tokens on the tested 512 and 8K 7B W8A16 gates. The capacity fix reports the expected per-block storage ratio `0.51953125`; mixed KV exposes about `1.56x` more blocks than BF16 on the 8K run. Full-cache dequant is not a viable high-GMU baseline because it OOMs; gather-dequant is the practical correctness baseline, and native mixed paged attention is the performance path. At 8K, native mixed decode raises model TPS from BF16 `4.34` to `14.64` (`3.37x`) and from gather mixed `4.43` to `14.64` (`3.30x`). At 512, native is still slower than BF16/gather because per-head Triton launch and short-context overhead dominate.
+
+### Next
+
+Broaden the 7B native mixed-KV gate to 16K/32K and more seeds, then optimize short-context native decode by increasing work per program or adding a threshold that uses gather/FlashAttention below a context-length cutoff.
+
+## 2026-05-14 Native Mixed KV 16K/32K Extension
+
+### Remote Evidence
+
+- 16K native: `.remote-logs/kv_mixed_opt_20260514/7b_native_store_triton_len16384/summary.json`
+- 32K native: `.remote-logs/kv_mixed_opt_20260514/7b_native_store_triton_len32512/summary.json`
+- Combined summary: `.remote-logs/kv_mixed_opt_20260514/native_8k16k32k_summary.json` and `.remote-logs/kv_mixed_opt_20260514/native_8k16k32k_summary.csv`
+
+### Result
+
+| Prompt | Exact | Cosine mean | BF16 model TPS | Native mixed model TPS | Speedup | Bytes/block vs BF16 | Block ratio |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8192 | yes | 0.99989 | 4.34 | 14.64 | 3.37x | 0.5195 | 1.56x |
+| 16384 | yes | 0.99987 | 4.11 | 10.77 | 2.62x | 0.5195 | 1.57x |
+| 32512 | yes | 0.99986 | 4.03 | 6.43 | 1.59x | 0.5195 | 1.53x |
+
+### Conclusion
+
+Native K-int8/V-FP8 keeps exact generated tokens and stable logits on the tested 8K/16K/32K 7B W8A16 prompts. The long-context headline is now README-worthy: `51.95%` per-block KV bytes, about `1.5x` more allocated KV blocks, and `1.59x` to `3.37x` model-TPS speedup over BF16 KV on these gates. The speedup declines at 32K because the current one-program-per-query-head Triton decode scales linearly with context; the next kernel step is to split long contexts across token blocks and reduce partials, while keeping a short-context fallback for 512-token prompts.

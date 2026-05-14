@@ -85,6 +85,11 @@ def _run_once(args: argparse.Namespace, kv_cache_dtype: str, experimental: bool)
         if getattr(runner, "v_scale_cache", torch.tensor([])).numel():
             scale_storage_bytes += runner.v_scale_cache.numel() * runner.v_scale_cache.element_size()
         kv_cache_data_bytes = int(kv_cache.numel() * kv_cache.element_size())
+        if kv_cache_data_bytes == 0 and hasattr(runner, "k_cache_storage") and hasattr(runner, "v_cache_storage"):
+            kv_cache_data_bytes = int(
+                runner.k_cache_storage.numel() * runner.k_cache_storage.element_size()
+                + runner.v_cache_storage.numel() * runner.v_cache_storage.element_size()
+            )
         return {
             "kv_cache_dtype": kv_cache_dtype,
             "kv_cache_scale_dtype": config.kv_cache_scale_dtype,
@@ -95,7 +100,11 @@ def _run_once(args: argparse.Namespace, kv_cache_dtype: str, experimental: bool)
             "num_kvcache_blocks": int(config.num_kvcache_blocks),
             "kvcache_block_size": int(config.kvcache_block_size),
             "kv_cache_shape": list(kv_cache.shape),
+            "k_cache_shape": list(getattr(runner, "k_cache_storage", kv_cache).shape),
+            "v_cache_shape": list(getattr(runner, "v_cache_storage", kv_cache).shape),
             "kv_cache_torch_dtype": str(kv_cache.dtype),
+            "k_cache_torch_dtype": str(getattr(runner, "k_cache_storage", kv_cache).dtype),
+            "v_cache_torch_dtype": str(getattr(runner, "v_cache_storage", kv_cache).dtype),
             "kv_cache_element_size": int(kv_cache.element_size()),
             "kv_cache_data_storage_bytes": kv_cache_data_bytes,
             "kv_cache_scale_storage_bytes": int(scale_storage_bytes),
@@ -160,6 +169,7 @@ def main() -> None:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--ep-size", type=int, default=1)
+    parser.add_argument("--kv-cache-dtype", default="fp8_e4m3", choices=("fp8_e4m3", "fp8_v_only", "k_int8_v_fp8"))
     parser.add_argument("--kv-cache-scale-dtype", default="float16", choices=("float16", "bfloat16", "float32"))
     parser.add_argument("--fp8-decode-backend", default="native", choices=("native", "gather_dequant", "full_dequant"))
     parser.add_argument("--native-block-tokens", type=int, default=64, choices=(16, 32, 64))
@@ -170,7 +180,7 @@ def main() -> None:
     args.model_path = os.path.expanduser(args.model_path)
 
     bf16 = _run_once(args, "bf16", False)
-    fp8 = _run_once(args, "fp8_e4m3", True)
+    fp8 = _run_once(args, args.kv_cache_dtype, True)
     comparison = _compare_results(bf16["results"], fp8["results"])
     summary = {
         "label": args.label,
@@ -179,13 +189,13 @@ def main() -> None:
         "output_len": args.output_len,
         "num_seqs": args.num_seqs,
         "bf16": bf16,
-        "fp8_e4m3": fp8,
+        args.kv_cache_dtype: fp8,
         "comparison": comparison,
-        "data_storage_ratio_fp8_over_bf16": fp8["kv_cache_data_storage_bytes"] / bf16["kv_cache_data_storage_bytes"],
-        "total_storage_ratio_fp8_over_bf16": fp8["kv_cache_total_storage_bytes"] / bf16["kv_cache_total_storage_bytes"],
-        "data_bytes_per_block_ratio_fp8_over_bf16": fp8["kv_cache_data_bytes_per_block"] / bf16["kv_cache_data_bytes_per_block"],
-        "total_bytes_per_block_ratio_fp8_over_bf16": fp8["kv_cache_total_bytes_per_block"] / bf16["kv_cache_total_bytes_per_block"],
-        "block_ratio_fp8_over_bf16": fp8["num_kvcache_blocks"] / bf16["num_kvcache_blocks"],
+        "data_storage_ratio_quant_over_bf16": fp8["kv_cache_data_storage_bytes"] / bf16["kv_cache_data_storage_bytes"],
+        "total_storage_ratio_quant_over_bf16": fp8["kv_cache_total_storage_bytes"] / bf16["kv_cache_total_storage_bytes"],
+        "data_bytes_per_block_ratio_quant_over_bf16": fp8["kv_cache_data_bytes_per_block"] / bf16["kv_cache_data_bytes_per_block"],
+        "total_bytes_per_block_ratio_quant_over_bf16": fp8["kv_cache_total_bytes_per_block"] / bf16["kv_cache_total_bytes_per_block"],
+        "block_ratio_quant_over_bf16": fp8["num_kvcache_blocks"] / bf16["num_kvcache_blocks"],
     }
     text = json.dumps(summary, indent=2, ensure_ascii=False)
     print(text)
