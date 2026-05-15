@@ -13,6 +13,10 @@ from common import emit_result, print_result, runtime_metadata
 from nanovllm.quantization.kernels import launch_w8a8_fused_gemm_experimental, quantize_activation_w8a8
 
 FP8_MAX = 448.0
+FUSED_TRITON_WARNING = (
+    "fused_triton is experimental and can trigger a Triton compiler abort on SM89; "
+    "pass --allow-fused-triton to run it."
+)
 
 
 def load_tensor(model_path: str, name: str) -> torch.Tensor:
@@ -55,7 +59,8 @@ def benchmark_weight(args: argparse.Namespace, weight_name: str) -> dict[str, An
     weight_scale = weight_scale.cuda()
     input_scale = input_scale.cuda()
 
-    if qweight.shape[0] != args.k:
+    expected_k = args.k or qweight.shape[0]
+    if qweight.shape[0] != expected_k:
         raise ValueError(f"{weight_name} K mismatch: qweight.shape={tuple(qweight.shape)}, expected K={args.k}")
     k, n = qweight.shape
     x = torch.randn((args.m, k), device="cuda", dtype=torch.bfloat16)
@@ -80,6 +85,21 @@ def benchmark_weight(args: argparse.Namespace, weight_name: str) -> dict[str, An
     full_out_by_backend: dict[str, torch.Tensor] = {}
     for backend in args.act_quant_backend:
         if backend == "fused_triton":
+            if not args.allow_fused_triton:
+                backend_results[backend] = {
+                    "skipped": True,
+                    "reason": FUSED_TRITON_WARNING,
+                    "ms": {"activation_quant": None, "scaled_mm_only": None, "full": None},
+                    "tflops": {"scaled_mm_only": None, "full": None},
+                    "ratios": {
+                        "activation_quant_pct_of_full": None,
+                        "scaled_mm_pct_of_full": None,
+                        "full_vs_bf16": None,
+                        "full_vs_w8a16": None,
+                    },
+                    "error_vs_bf16_dequant": None,
+                }
+                continue
             fused_ms, fused_out = cuda_time(
                 lambda: launch_w8a8_fused_gemm_experimental(x, w_scaled_mm, input_scale, scale_b, None),
                 args.warmup,
@@ -238,7 +258,8 @@ def main() -> None:
     parser.add_argument("--label", default="fp8_linear_microbench")
     parser.add_argument("--weight-name", action="append", required=True)
     parser.add_argument("--m", type=int, required=True)
-    parser.add_argument("--k", type=int, required=True)
+    parser.add_argument("--k", type=int, default=0, help="Expected input dimension; inferred from qweight when omitted")
+    parser.add_argument("--allow-fused-triton", action="store_true", help="Run experimental fused_triton backend")
     parser.add_argument(
         "--act-quant-backend",
         action="append",

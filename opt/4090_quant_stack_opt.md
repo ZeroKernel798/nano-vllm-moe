@@ -392,3 +392,168 @@ Broaden the 7B native mixed-KV gate to 16K/32K and more seeds, then optimize sho
 ### Conclusion
 
 Native K-int8/V-FP8 keeps exact generated tokens and stable logits on the tested 8K/16K/32K 7B W8A16 prompts. The long-context headline is now README-worthy: `51.95%` per-block KV bytes, about `1.5x` more allocated KV blocks, and `1.59x` to `3.37x` model-TPS speedup over BF16 KV on these gates. The speedup declines at 32K because the current one-program-per-query-head Triton decode scales linearly with context; the next kernel step is to split long contexts across token blocks and reduce partials, while keeping a short-context fallback for 512-token prompts.
+
+## 2026-05-14 W8A8 Shape-aware Runtime Start
+
+### Scope
+
+Restarted W8A8 after the K-int8/V-FP8 gate passed. The first optimization is profile-driven rather than blanket W8A8: default activation quantization now uses the Triton elementwise path, `fused_triton` microbench is guarded because it aborts the SM89 Triton compiler, and runtime uses `_scaled_mm` only for large linear shapes while small 2K attention projections fall back to FP8-weight dequant matmul.
+
+### Remote Evidence
+
+- Root: `.remote-logs/w8a8_opt_20260514/`
+- Initial 3B shape profile: `.remote-logs/w8a8_opt_20260514/3b_w8a8_microbench_m512_torch_triton.json`
+- Post-patch guarded microbench: `.remote-logs/w8a8_opt_20260514/3b_w8a8_microbench_m512_after_patch.json`
+- Additional shapes: `.remote-logs/w8a8_opt_20260514/3b_w8a8_more_shapes_m512_triton.json`
+- Shape-aware 3B smoke: `.remote-logs/w8a8_opt_20260514/3b_w8a8_shape_aware_smoke/`
+- All-scaled-mm comparison: `.remote-logs/w8a8_opt_20260514/3b_w8a8_all_scaled_mm_smoke/`
+- 3B logits/token gate: `.remote-logs/w8a8_opt_20260514/3b_w8a8_shape_aware_compare/`
+- 7B shape profile: `.remote-logs/w8a8_opt_20260514/7b_w8a8_shapes_m512_triton.json`
+- 7B cutoff-3072 smoke: `.remote-logs/w8a8_opt_20260514/7b_w8a8_shape_aware_cut3072_smoke/`
+- Failed 7B HF proxy compare: `.remote-logs/w8a8_opt_20260514/7b_w8a8_shape_aware_compare/` failed with CUDA OOM while loading both BF16 and W8A8 proxy models on 24GB.
+
+### Result
+
+Representative 3B W8A8 linear profile at `M=512`:
+
+| Weight | Shape `(M,K,N)` | W8A8 full vs BF16 | W8A8 full vs W8A16 dequant | Triton act-quant speedup vs torch | Decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `mlp.gate_proj` | `512,2048,11008` | `0.49x-0.51x` | `0.28x-0.29x` | `1.78x-2.22x` | use W8A8 `_scaled_mm` |
+| `mlp.up_proj` | `512,2048,11008` | `0.49x` | `0.28x` | `2.09x` | use W8A8 `_scaled_mm` |
+| `mlp.down_proj` | `512,11008,2048` | `0.93x` | `0.46x` | `2.13x` | use W8A8 `_scaled_mm`, marginal vs BF16 |
+| `self_attn.q_proj/o_proj` | `512,2048,2048` | `2.61x-2.66x` | `1.49x-1.52x` | `1.73x-1.80x` | fallback from W8A8 `_scaled_mm` |
+
+Model-level 3B smoke with shape-aware runtime passes: checkpoint contract has `252` qweight/weight_scale/input_scale tensors, benchmark prefill TPS is `10047.6`, decode TPS is `87.62`, and memory run reports model size `3.41 GB`. The all-scaled-mm comparison has lower benchmark prefill TPS (`9277.6`) on the same 512/16 smoke, supporting the shape cutoff. The 3B BF16-vs-W8A8 correctness gate passes on three prompts with avg logits cosine `0.998857`, top1 match rate `1.0`, top10 overlap `0.9667`, and exact generated tokens for all prompts.
+
+The 7B W8A8 checkpoint also has a healthy contract (`196` qweight/weight_scale/input_scale tensors). At `M=512`, the 7B shape profile shows W8A8 full vs BF16 ratios of `0.49x` for `gate_proj`, `0.49x` for `up_proj`, `0.78x` for `down_proj`, `0.88x` for `q_proj`, and `0.87x` for `o_proj`, so the default cutoff was lowered from `4096` to `3072`. The cutoff-3072 7B smoke passes with benchmark prefill TPS `8775.6`, decode TPS `61.48`, and memory-run model size `8.72 GB`. The existing HF proxy logits/token compare is not memory-safe for 7B on 24GB because it loads BF16 and W8A8 proxy models together and OOMs.
+
+### Conclusion
+
+W8A8 is now worth continuing, but only as a shape-aware backend. Large MLP projections win clearly because `_scaled_mm` speed offsets activation quantization; 2K attention projections lose because activation quantization dominates, while 7B's 3584-wide attention projections already benefit. The current default cutoff is `NANOVLLM_FP8_W8A8_SCALED_MM_MIN_DIM=3072`. The next gate is a memory-safe 7B PPL/logits path plus longer generation before advertising W8A8 as a complete 7B quality stage.
+
+## 2026-05-15 W8A8 Memory-safe 7B Quality Gate
+
+### Scope
+
+Confirmed the 7B W8A8 checkpoint was calibrated on WikiText-2 validation with `cache_dir=/home/ubuntu/project/datasets`, `samples=32`, `max_length=256`, and `batch_size=2`. Added a memory-safe comparison mode: `compare_logits.py --sequential-load` loads BF16 and W8A8 proxy models one at a time, and `run_quant_suite.py --sequential-compare` passes it through the suite. This avoids the previous 24GB OOM from loading both 7B models concurrently.
+
+### Remote Evidence
+
+- Sequential logits/token gate: `.remote-logs/w8a8_opt_20260515/7b_w8a8_seq_compare/`
+- BF16 same-data PPL: `.remote-logs/w8a8_opt_20260515/7b_bf16_wikitext_ppl/`
+- W8A8 same-data PPL: `.remote-logs/w8a8_opt_20260515/7b_w8a8_wikitext_ppl/`
+
+### Result
+
+| Gate | BF16 | W8A8 | Notes |
+| --- | ---: | ---: | --- |
+| WikiText-2 validation PPL, 1024 tokens | `8.3971` | `8.4238` | same dataset/cache as calibration |
+| Sequential logits avg cosine | reference | `0.999505` | 3 fixed prompts |
+| Sequential top1 match | reference | `0.667` | 2/3 prompts |
+| Sequential top10 overlap | reference | `0.967` | 3 fixed prompts |
+| Sequential generation exact match | reference | `0.667` | avg token match ratio `0.75` |
+
+### Conclusion
+
+The memory-safe quality gate is now usable on a 24GB RTX 4090. Same-data PPL drift is small (`+0.0267` absolute), and logits cosine stays high, but greedy generation is not exact on all prompts. W8A8 should remain shape-aware and promising, not final-default, until a broader prompt/token gate confirms acceptable generation stability.
+
+## 2026-05-15 MMLU Logit-rank And GSM8K Numeric Probes
+
+### Scope
+
+Added two quality gates beyond fixed prompts. `eval_choice_logits.py` evaluates MMLU/CEval-style multiple-choice tasks by ranking the next-token logits for `A/B/C/D`, loading BF16 and W8A8 sequentially to stay within 24GB. `eval_gsm8k_generate.py` runs a greedy numeric GSM8K probe and extracts the final number from generated text. MMLU/CEval is the primary quantization gate because it avoids long-generation butterfly effects; GSM8K is a generation-sensitivity supplement.
+
+### Remote Evidence
+
+- MMLU smoke, 100 questions: `.remote-logs/w8a8_opt_20260515/7b_w8a8_mmlu_smoke.json`
+- MMLU 300 questions: `.remote-logs/w8a8_opt_20260515/7b_w8a8_mmlu_300.json`
+- GSM8K 50 questions: `.remote-logs/w8a8_opt_20260515/7b_w8a8_gsm8k_50.json`
+
+### Result
+
+| Gate | Samples | BF16 | W8A8 | Agreement | Notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| MMLU smoke | 100 | `0.68` | `0.68` | `0.96` | abstract algebra + elementary math |
+| MMLU mixed | 300 | `0.6033` | `0.6200` | `0.9567` | 6 subjects, 50 each |
+| GSM8K numeric | 50 | `0.32` | `0.36` | `0.28` | greedy generation final-number probe |
+
+### Conclusion
+
+The MMLU logit-rank gate supports W8A8: accuracy does not regress on this 300-question slice, and prediction agreement stays high (`95.67%`). GSM8K accuracy also does not regress on the 50-question slice, but same-number agreement is low because generation diverges frequently; use it as a supplementary generation-stability signal, not as the primary quantization correctness criterion. The next quality step is to broaden MMLU and add CEval subsets before promoting W8A8 as a final 7B quality stage.
+
+## 2026-05-15 W8A16/W8A8 Performance Bottleneck Pass
+
+### Scope
+
+Rechecked the current W8A16 and W8A8 bottlenecks with explicit baseline/candidate A/B runs on the remote RTX 4090. The goal was to keep stable baselines while testing conservative runtime switches, not to promote an unbounded memory-heavy mode as default.
+
+### Remote Evidence
+
+- Root: `.remote-logs/w8_perf_opt_20260515/`
+- Earlier W8A8 layer microbench baseline: `.remote-logs/w8_perf_opt_20260515_baseline/` on the remote machine.
+- 3B model-level A/B: `3b_w8a16_dequant_512x16.json`, `3b_w8a16_load_dequant_512x16.json`, `3b_w8a8_shape_default_512x16.json`, `3b_w8a8_shape_cache_fallback_512x16.json`, `3b_w8a8_all_load_dequant_512x16.json`.
+- 7B model-level A/B: `7b_w8a16_dequant_512x16.json`, `7b_w8a16_load_dequant_attention_512x16.json`; full 7B load-dequant was also tried and failed with CUDA OOM during warmup.
+
+### Runtime Changes
+
+- Added `NANOVLLM_FP8_W8A16_BACKEND` with `auto`, `dequant_matmul`, `load_dequant`, `load_dequant_attention`, and `triton` choices.
+- Kept the existing SM89 default safe: `auto` still falls back to per-forward dequant on RTX 4090 because the Triton W8A16 kernel emits SM90-only BF16 conversion instructions and fails ptxas on SM89.
+- Added optional load-time BF16 dequant caching for W8A16. Full-model caching is fast on 3B but OOMs on 7B/24GB, so it remains opt-in only.
+- Added `load_dequant_attention` as a 7B-safe compromise that caches only attention projections and leaves MLP per-forward dequantized.
+- Added optional W8A8 dequant-cache support for fallback layers via `NANOVLLM_FP8_W8A8_CACHE_DEQUANT=1`, while preserving the `NANOVLLM_FP8_W8A8_SCALED_MM_MIN_DIM=3072` shape-aware default.
+
+### 3B Results (`input=512`, `output=16`, warmup 1, repeat 2)
+
+| Mode | Wall time | Prefill TPS | Decode TPS | E2E TPS | Takeaway |
+| --- | ---: | ---: | ---: | ---: | --- |
+| W8A16 per-forward dequant baseline | `0.4687 s` | `5509.8` | `38.15` | `1127.3` | stable but dequant dominates |
+| W8A16 load-time dequant | `0.1679 s` | `9805.8` | `116.75` | `3144.3` | `2.79x` lower wall time, memory-heavy |
+| W8A8 shape-aware default | `0.2350 s` | `6544.5` | `86.86` | `2249.8` | still pays fallback dequant overhead |
+| W8A8 shape-aware + cached fallback | `0.2062 s` | `7173.7` | `100.61` | `2563.8` | `1.14x` lower wall time vs default |
+| W8A8 all cached dequant | `0.1823 s` | `7450.2` | `115.45` | `2897.2` | fastest W8A8 3B mode but loses W8A8 scaled-mm benefit |
+
+### 7B Results (`input=512`, `output=16`, warmup 1, repeat 1)
+
+| Mode | Wall time | Prefill TPS | Decode TPS | E2E TPS | Takeaway |
+| --- | ---: | ---: | ---: | ---: | --- |
+| W8A16 per-forward dequant baseline | `1.0892 s` | `5108.0` | `15.17` | `484.7` | current safe baseline |
+| W8A16 attention-only load-dequant | `1.0273 s` | `5380.2` | `16.10` | `514.0` | small but real `1.06x` wall-time win |
+| W8A16 full load-dequant | OOM | n/a | n/a | n/a | exceeds 24GB during warmup |
+| W8A16 Triton kernel | compile fail | n/a | n/a | n/a | ptxas rejects SM90-only BF16 conversions on SM89 |
+
+### Conclusion
+
+The immediate W8A16 bottleneck is not checkpoint quality or model loading; it is per-forward FP8-to-BF16 weight dequantization. Load-time BF16 dequant proves the speed ceiling on 3B, but full 7B caching is not viable on a 24GB RTX 4090. The safe 7B direction is selective caching, starting with attention projections for a small win, or a true SM89-compatible weight-only kernel. For W8A8, activation quantization and scaled-mm overhead remain bad for small attention shapes, and fallback layers also suffer from per-forward dequant. Caching fallback dequant improves 3B but should remain opt-in until a 7B memory gate is run.
+
+### Next
+
+1. Add memory reporting for load-time dequant/cache modes to quantify the model-size tradeoff instead of only throughput.
+2. Probe `load_dequant_attention` at 7B with `output=64` and mixed KV enabled to see whether decode-heavy workloads amplify the small 512/16 gain.
+3. Build or adapt an SM89-safe W8A16 kernel that avoids the current Triton BF16 conversion codegen failure.
+4. Run W8A8 fallback-cache on 7B with a conservative memory shape before considering any default change.
+
+## 2026-05-15 SM89 W8A16 On-the-fly Triton Kernel Fix
+
+### Scope
+
+Reworked the W8A16 Triton kernel to avoid the RTX 4090 / SM89 ptxas failure caused by direct FP8-to-BF16 conversion. The kernel now performs on-the-fly dequantization inside the GEMM loop by casting FP8 weights through FP32 and then FP16 before `tl.dot`; activations are also cast through FP32 to FP16 so both dot operands have the same dtype. No load-time BF16 weight cache is used.
+
+### Remote Evidence
+
+- Root: `.remote-logs/w8a16_triton_sm89_20260515/`
+- Initial failed log with mixed BF16/FP16 dot: `3b_w8a16_triton_512x16.log`
+- Passing 3B Triton run: `3b_w8a16_triton_512x16_fp16dot.json`
+- Same-settings 3B per-forward dequant baseline: `3b_w8a16_dequant_same_settings.json`
+- Passing 7B Triton smoke: `7b_w8a16_triton_512x16_fp16dot.json`
+
+### Result
+
+| Model | Backend | Wall time | Prefill TPS | Decode TPS | E2E TPS | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| 3B | per-forward dequant baseline | `1.1368 s` | `692.4` | `37.76` | `464.4` | same command shape, no warmup |
+| 3B | Triton FP8->FP32->FP16 on-the-fly | `0.8247 s` | `710.7` | `143.90` | `640.2` | compiles on SM89; no cache |
+| 7B | Triton FP8->FP32->FP16 on-the-fly | `0.9960 s` | `650.6` | `71.79` | `530.1` | compiles and runs on SM89; no cache |
+
+### Conclusion
+
+The SM90-only instruction issue is fixed for the W8A16 Triton path: the passing logs show no ptxas BF16 conversion failure on RTX 4090. The current kernel is a real on-the-fly dequantization path and does not allocate BF16 decompressed weights. It is decode-friendly but prefill is still weak, likely because the simple FP16 dot path loses BF16/FP8 tensor-core efficiency and still pays conversion overhead inside the K loop. Keep it as an opt-in/runtime candidate for now while optimizing tile choices and conversion placement.

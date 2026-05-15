@@ -75,7 +75,7 @@ Benchmark setup: 2026-05-13, 1x RTX 4090 24GB, Qwen2.5-7B-Instruct, fixed synthe
 | BF16 | 15.24 GB | 7.4367 | 10634.5 | 62.50 | 489.6 | 61.81 | 19.98 GB |
 | W8A16 | 8.72 GB | 7.4772 | 5258.7 | 15.22 | 668.7 | 15.26 | 20.92 GB |
 
-W8A16 checkpoint contract is healthy (`196` qweight tensors and `196` weight-scale tensors). Current SM89 runtime uses per-forward BF16 dequant matmul, so W8A16 is a memory/quality milestone, not a speed win yet.
+W8A16 checkpoint contract is healthy (`196` qweight tensors and `196` weight-scale tensors). The original SM89 Triton path failed because direct FP8-to-BF16 conversion emitted SM90-only instructions; the current W8A16 Triton kernel avoids that by doing on-the-fly FP8->FP32->FP16 dequantization inside the GEMM loop, with no load-time decompressed weight cache. On 2026-05-15, the 3B 512/16 smoke improved from `1.1368 s` per-forward dequant to `0.8247 s` with the SM89-safe Triton path, and decode TPS rose from `37.76` to `143.90`; a 7B 512/16 Triton smoke also compiles and runs (`0.9960 s`, decode TPS `71.79`). Prefill remains weak, so tile/conversion optimization is still the next W8A16 runtime task.
 
 ### Latest 7B FP8 KV Probe
 
@@ -106,6 +106,19 @@ K-int8/V-FP8 mixed KV now passes the 512/8K/16K token-match gate on 7B W8A16, wi
 | 16384 | K-int8/V-FP8 native | yes | 0.99987 | 10.77 | 2.62x | 0.5195 | 1.57x |
 | 32512 | BF16 KV | reference | reference | 4.03 | 1.00x | 1.0000 | 1.00x |
 | 32512 | K-int8/V-FP8 native | yes | 0.99986 | 6.43 | 1.59x | 0.5195 | 1.53x |
+
+### Latest 7B W8A8 Quality Probe
+
+W8A8 has restarted as a profiled, shape-aware backend rather than a blanket mode. On 3B W8A8 static at `M=512`, large MLP projections benefit from `_scaled_mm`, while 2K attention projections lose to activation-quant overhead and now fall back to FP8-weight dequant matmul by default. The runtime cutoff is controlled by `NANOVLLM_FP8_W8A8_SCALED_MM_MIN_DIM` and defaults to `3072`; W8A8 activation quant defaults to the Triton path.
+
+| Gate | BF16 | W8A8 shape-aware | Takeaway |
+| --- | ---: | ---: | --- |
+| MMLU logit-rank, 300 questions | `0.6033` | `0.6200` | no accuracy regression; prediction agreement `0.9567` |
+| WikiText-2 validation PPL, 1024 tokens | `8.3971` | `8.4238` | small absolute drift `+0.0267` |
+| GSM8K numeric, 50 questions | `0.32` | `0.36` | no accuracy regression, but generation agreement is low |
+| 7B model size | `15.24 GB` | `8.72 GB` | checkpoint is `42.8%` smaller |
+
+The 3B smoke passes with shape-aware prefill TPS `10047.6` versus all-scaled-mm `9277.6`; the BF16-vs-W8A8 correctness probe has avg logits cosine `0.998857` and exact generated tokens on all three prompts. The same cutoff has now started on 7B: checkpoint contract is healthy (`196` qweight/weight-scale/input-scale tensors), shape profile shows `0.49x/0.49x/0.78x` W8A8-vs-BF16 for `gate/up/down` and `0.87x-0.88x` for attention projections, and the 512/16 smoke reports prefill TPS `8775.6`, decode TPS `61.48`, model size `8.72 GB`. On 2026-05-15, W8A8 fallback-layer dequant caching improved the 3B 512/16 wall time from `0.2350 s` to `0.2062 s`, but it remains opt-in until a 7B memory gate passes. On the same WikiText-2 validation data used for W8A8 calibration, the 7B HF proxy PPL is `8.4238` versus BF16 `8.3971` over 1024 tokens. A memory-safe MMLU logit-rank gate over 300 questions reports BF16 accuracy `0.6033`, W8A8 accuracy `0.6200`, and prediction agreement `0.9567`; GSM8K 50-question greedy numeric probe reports BF16 `0.32`, W8A8 `0.36`, but only `0.28` same-number agreement, so GSM8K remains a generation-sensitivity probe rather than the primary quantization gate.
 
 ## Repository Map
 
@@ -152,4 +165,4 @@ python scripts/quantization/run_4090_7b_stack.py \
 
 1. Broaden native K-int8/V-FP8 gates to 16K/32K and more seeds, then add a short-context backend cutoff.
 2. Replace or optimize the current SM89 W8A16 dequant-matmul runtime.
-3. Re-enter W8A8 only after W8A16 and FP8 KV have clean 7B gates.
+3. Broaden MMLU/CEval coverage before final W8A8 promotion.

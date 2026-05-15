@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -110,6 +111,106 @@ def compare_prompt(
     }
 
 
+def run_model_prompt(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    args: argparse.Namespace,
+    device: str,
+) -> dict[str, Any]:
+    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=args.max_prompt_tokens)
+    input_ids = encoded.input_ids.to(device)
+    attention_mask = encoded.attention_mask.to(device) if "attention_mask" in encoded else None
+    with torch.inference_mode():
+        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits[:, -1, :].float().squeeze(0).cpu()
+        generated = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            do_sample=False,
+            max_new_tokens=args.max_new_tokens,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    new_tokens = generated[0, input_ids.shape[1] :].cpu().tolist()
+    return {
+        "prompt": prompt,
+        "prompt_tokens": int(input_ids.numel()),
+        "logits": logits,
+        "token_ids": new_tokens,
+        "text": tokenizer.decode(new_tokens, skip_special_tokens=False),
+    }
+
+
+def release_cuda_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def compare_outputs(baseline: dict[str, Any], quant: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    b = baseline["logits"]
+    q = quant["logits"]
+    diff = (q - b).abs()
+    baseline_top1 = int(b.argmax().item())
+    quant_top1 = int(q.argmax().item())
+    baseline_new = baseline["token_ids"]
+    quant_new = quant["token_ids"]
+    aligned = sum(1 for left, right in zip(baseline_new, quant_new) if left == right)
+    denom = max(len(baseline_new), len(quant_new), 1)
+    return {
+        "prompt": baseline["prompt"],
+        "prompt_tokens": baseline["prompt_tokens"],
+        "logits": {
+            "max_abs_error": float(diff.max().item()),
+            "mean_abs_error": float(diff.mean().item()),
+            "cosine": float(F.cosine_similarity(b, q, dim=0).item()),
+            "top1_match": baseline_top1 == quant_top1,
+            "baseline_top1_token_id": baseline_top1,
+            "quant_top1_token_id": quant_top1,
+            "top5_overlap": topk_overlap(b, q, 5),
+            "top10_overlap": topk_overlap(b, q, 10),
+        },
+        "generation": {
+            "max_new_tokens": args.max_new_tokens,
+            "baseline_token_ids": baseline_new,
+            "quant_token_ids": quant_new,
+            "token_match_count": aligned,
+            "token_match_ratio": aligned / denom,
+            "exact_match": baseline_new == quant_new,
+            "baseline_text": baseline["text"],
+            "quant_text": quant["text"],
+        },
+    }
+
+
+def compare_prompts_sequential(
+    baseline_model_path: str,
+    eval_model_path: str,
+    tokenizer: AutoTokenizer,
+    prompts: list[str],
+    dtype: torch.dtype,
+    args: argparse.Namespace,
+    device: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    baseline_model = load_model(baseline_model_path, dtype, device, args.trust_remote_code)
+    baseline_outputs = [run_model_prompt(baseline_model, tokenizer, prompt, args, device) for prompt in prompts]
+    memory_after_baseline = cuda_memory_snapshot("after_baseline_")
+    del baseline_model
+    release_cuda_memory()
+
+    quant_model = load_model(eval_model_path, dtype, device, args.trust_remote_code)
+    quant_outputs = [run_model_prompt(quant_model, tokenizer, prompt, args, device) for prompt in prompts]
+    memory_after_quant = cuda_memory_snapshot("after_quant_")
+    del quant_model
+    release_cuda_memory()
+
+    comparisons = [compare_outputs(baseline, quant, args) for baseline, quant in zip(baseline_outputs, quant_outputs)]
+    return comparisons, {
+        "after_baseline": memory_after_baseline,
+        "after_quant": memory_after_quant,
+    }
+
+
 def summarize(comparisons: list[dict[str, Any]]) -> dict[str, Any]:
     if not comparisons:
         return {}
@@ -139,6 +240,7 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--sequential-load", action="store_true", help="Load baseline and quant models one at a time to reduce peak memory")
     parser.add_argument("--output-json")
     parser.add_argument("--output-jsonl")
     parser.add_argument("--output-csv")
@@ -164,11 +266,23 @@ def main() -> None:
         tokenizer = AutoTokenizer.from_pretrained(baseline_model_path, trust_remote_code=args.trust_remote_code)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
-        baseline_model = load_model(baseline_model_path, dtype, device, args.trust_remote_code)
-        quant_model = load_model(eval_model_path, dtype, device, args.trust_remote_code)
-        result["memory_after_load"] = cuda_memory_snapshot("after_load_")
         prompts = load_prompts(args)
-        comparisons = [compare_prompt(baseline_model, quant_model, tokenizer, prompt, args, device) for prompt in prompts]
+        if args.sequential_load:
+            comparisons, memory = compare_prompts_sequential(
+                baseline_model_path,
+                eval_model_path,
+                tokenizer,
+                prompts,
+                dtype,
+                args,
+                device,
+            )
+            result["memory_sequential"] = memory
+        else:
+            baseline_model = load_model(baseline_model_path, dtype, device, args.trust_remote_code)
+            quant_model = load_model(eval_model_path, dtype, device, args.trust_remote_code)
+            result["memory_after_load"] = cuda_memory_snapshot("after_load_")
+            comparisons = [compare_prompt(baseline_model, quant_model, tokenizer, prompt, args, device) for prompt in prompts]
         result["comparisons"] = comparisons
         result["summary"] = summarize(comparisons)
         result["elapsed_s"] = perf_counter() - start

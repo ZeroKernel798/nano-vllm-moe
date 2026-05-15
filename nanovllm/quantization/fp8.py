@@ -7,17 +7,52 @@ from typing import Any
 import torch
 from torch import nn
 
-from nanovllm.quantization.kernels import launch_scaled_mm_w8a8, launch_w8a16_gemm, to_scaled_mm_weight
+from nanovllm.quantization.kernels import (
+    launch_scaled_mm_w8a8,
+    launch_w8a16_gemm,
+    launch_w8a8_fused_gemm_experimental,
+    to_scaled_mm_weight,
+)
 from nanovllm.quantization.base_config import QuantizationConfig, QuantizeMethodBase
 
 
 _SUPPORTED_FP8_TYPES = {"fp8_w8a16", "fp8_w8a8_static"}
 _FP8_BACKEND_LOGGED: set[str] = set()
 _SUPPORTED_W8A8_ACT_QUANT_BACKENDS = {"torch", "triton"}
+_SUPPORTED_W8A8_RUNTIME_BACKENDS = {"scaled_mm", "fused_triton"}
+_SUPPORTED_W8A16_BACKENDS = {"auto", "dequant_matmul", "triton"}
+
+
+def get_w8a8_scaled_mm_min_dim() -> int:
+    return int(os.environ.get("NANOVLLM_FP8_W8A8_SCALED_MM_MIN_DIM", "3072"))
+
+
+def get_w8a8_scaled_mm_min_m() -> int:
+    return int(os.environ.get("NANOVLLM_FP8_W8A8_SCALED_MM_MIN_M", "1"))
+
+
+def get_w8a8_runtime_backend() -> str:
+    backend = os.environ.get("NANOVLLM_FP8_W8A8_RUNTIME_BACKEND", "scaled_mm").strip().lower()
+    if backend not in _SUPPORTED_W8A8_RUNTIME_BACKENDS:
+        raise ValueError(
+            "NANOVLLM_FP8_W8A8_RUNTIME_BACKEND must be one of "
+            f"{sorted(_SUPPORTED_W8A8_RUNTIME_BACKENDS)}, got {backend!r}"
+        )
+    return backend
+
+
+def get_w8a16_backend() -> str:
+    backend = os.environ.get("NANOVLLM_FP8_W8A16_BACKEND", "auto").strip().lower()
+    if backend not in _SUPPORTED_W8A16_BACKENDS:
+        raise ValueError(
+            "NANOVLLM_FP8_W8A16_BACKEND must be one of "
+            f"{sorted(_SUPPORTED_W8A16_BACKENDS)}, got {backend!r}"
+        )
+    return backend
 
 
 def get_w8a8_act_quant_backend() -> str:
-    backend = os.environ.get("NANOVLLM_FP8_W8A8_ACT_QUANT", "torch").strip().lower()
+    backend = os.environ.get("NANOVLLM_FP8_W8A8_ACT_QUANT", "triton").strip().lower()
     if backend not in _SUPPORTED_W8A8_ACT_QUANT_BACKENDS:
         raise ValueError(
             "NANOVLLM_FP8_W8A8_ACT_QUANT must be one of "
@@ -42,13 +77,14 @@ class Fp8Config(QuantizationConfig):
         return "fp8"
 
     def get_quant_method(self, layer: nn.Module, prefix: str = "") -> QuantizeMethodBase | None:
-        del layer, prefix
-        return Fp8LinearMethod(self)
+        del layer
+        return Fp8LinearMethod(self, prefix)
 
 
 class Fp8LinearMethod(QuantizeMethodBase):
-    def __init__(self, quant_config: Fp8Config) -> None:
+    def __init__(self, quant_config: Fp8Config, prefix: str = "") -> None:
         self.quant_config = quant_config
+        self.prefix = prefix
 
     def create_weights(
         self,
@@ -85,26 +121,40 @@ class Fp8LinearMethod(QuantizeMethodBase):
             if not hasattr(torch, "_scaled_mm"):
                 raise RuntimeError("fp8_w8a8_static requires torch._scaled_mm")
             qweight = layer.qweight.view(torch.float8_e4m3fn)
-            weight_scale = layer.weight_scale.to(torch.float32)
-            tensor_scale = weight_scale.max().clamp(min=1e-12)
-            rescale = (weight_scale / tensor_scale).reshape(1, -1)
-            scaled_weight = (qweight.to(torch.float32) * rescale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-            layer.register_buffer("qweight_scaled_mm", to_scaled_mm_weight(scaled_weight))
-            layer.register_buffer("weight_scale_scaled_mm", tensor_scale.reshape(()).to(torch.float32))
-            layer._fp8_backend = "w8a8_scaled_mm"
-            layer._fp8_w8a8_act_quant_backend = get_w8a8_act_quant_backend()
-            log_key = f"w8a8_scaled_mm_{layer._fp8_w8a8_act_quant_backend}"
+            min_dim = get_w8a8_scaled_mm_min_dim()
+            if max(qweight.shape) >= min_dim:
+                weight_scale = layer.weight_scale.to(torch.float32)
+                tensor_scale = weight_scale.max().clamp(min=1e-12)
+                rescale = (weight_scale / tensor_scale).reshape(1, -1)
+                scaled_weight = (qweight.to(torch.float32) * rescale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+                layer.register_buffer("qweight_scaled_mm", to_scaled_mm_weight(scaled_weight))
+                layer.register_buffer("weight_scale_scaled_mm", tensor_scale.reshape(()).to(torch.float32))
+                layer._fp8_backend = "w8a8_scaled_mm"
+                layer._fp8_w8a8_act_quant_backend = get_w8a8_act_quant_backend()
+                layer._fp8_w8a8_runtime_backend = get_w8a8_runtime_backend()
+                layer._fp8_w8a8_scaled_mm_min_m = get_w8a8_scaled_mm_min_m()
+            else:
+                layer._fp8_backend = "w8a8_dequant_matmul"
+            log_key = (
+                f"{layer._fp8_backend}_"
+                f"{getattr(layer, '_fp8_w8a8_runtime_backend', '')}_"
+                f"{getattr(layer, '_fp8_w8a8_act_quant_backend', '')}_"
+                f"{getattr(layer, '_fp8_w8a8_scaled_mm_min_m', '')}"
+            )
             if log_key not in _FP8_BACKEND_LOGGED:
                 print(
-                    "[nanovllm] FP8 W8A8 static using torch._scaled_mm "
-                    f"tensor-wise weight scale and {layer._fp8_w8a8_act_quant_backend} activation quant"
+                    "[nanovllm] FP8 W8A8 static using "
+                    f"{layer._fp8_backend} with scaled_mm_min_dim={min_dim}, "
+                    f"scaled_mm_min_m={getattr(layer, '_fp8_w8a8_scaled_mm_min_m', 'n/a')}, "
+                    f"runtime_backend={getattr(layer, '_fp8_w8a8_runtime_backend', 'n/a')}"
                 )
                 _FP8_BACKEND_LOGGED.add(log_key)
             return
-        if capability >= (9, 0):
+        w8a16_backend = get_w8a16_backend()
+        if w8a16_backend == "triton" or (w8a16_backend == "auto" and capability >= (8, 9)):
             layer._fp8_backend = "w8a16_triton"
             if "triton" not in _FP8_BACKEND_LOGGED:
-                print("[nanovllm] FP8 W8A16 using Triton weight-only kernel")
+                print("[nanovllm] FP8 W8A16 using Triton on-the-fly weight dequant kernel")
                 _FP8_BACKEND_LOGGED.add("triton")
             return
         layer._fp8_backend = "w8a16_dequant_matmul"
@@ -120,19 +170,31 @@ class Fp8LinearMethod(QuantizeMethodBase):
         w_fp8 = layer.qweight.view(torch.float8_e4m3fn)
         backend = getattr(layer, "_fp8_backend", None)
         if x.is_cuda and backend == "w8a8_scaled_mm":
-            out = launch_scaled_mm_w8a8(
-                x_2d,
-                layer.qweight_scaled_mm,
-                layer.input_scale,
-                layer.weight_scale_scaled_mm,
-                bias,
-                getattr(layer, "_fp8_w8a8_act_quant_backend", "torch"),
-            )
-            return out.view(*x.shape[:-1], -1).to(target_dtype)
+            if x_2d.shape[0] >= getattr(layer, "_fp8_w8a8_scaled_mm_min_m", 16):
+                runtime_backend = getattr(layer, "_fp8_w8a8_runtime_backend", "scaled_mm")
+                if runtime_backend == "fused_triton":
+                    out = launch_w8a8_fused_gemm_experimental(
+                        x_2d,
+                        layer.qweight_scaled_mm,
+                        layer.input_scale,
+                        layer.weight_scale_scaled_mm,
+                        bias,
+                    )
+                else:
+                    out = launch_scaled_mm_w8a8(
+                        x_2d,
+                        layer.qweight_scaled_mm,
+                        layer.input_scale,
+                        layer.weight_scale_scaled_mm,
+                        bias,
+                        getattr(layer, "_fp8_w8a8_act_quant_backend", "torch"),
+                    )
+                return out.view(*x.shape[:-1], -1).to(target_dtype)
+            backend = "w8a8_dequant_matmul"
         if x.is_cuda and backend == "w8a16_triton":
             out = launch_w8a16_gemm(x_2d, w_fp8, layer.weight_scale, bias)
             return out.view(*x.shape[:-1], -1).to(target_dtype)
-        if backend == "w8a16_dequant_matmul" or not x.is_cuda:
+        if backend in {"w8a16_dequant_matmul", "w8a8_dequant_matmul"} or not x.is_cuda:
             w_bf16 = w_fp8.to(torch.bfloat16) * layer.weight_scale.to(torch.bfloat16).unsqueeze(0)
             out = torch.mm(x_2d, w_bf16)
             if bias is not None:

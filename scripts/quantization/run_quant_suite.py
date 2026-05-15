@@ -50,6 +50,7 @@ def main() -> None:
     parser.add_argument("--dataset-cache-dir", default="")
     parser.add_argument("--quant-format", default="auto")
     parser.add_argument("--compare-max-new-tokens", type=int, default=16)
+    parser.add_argument("--sequential-compare", action="store_true", help="Load baseline and quant models one at a time for compare")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir or f".remote-logs/quantization/{now_tag()}")
@@ -120,6 +121,7 @@ def main() -> None:
                     str(args.compare_max_new_tokens),
                     "--output-json",
                     str(output_dir / "compare.json"),
+                    *(["--sequential-load"] if args.sequential_compare else []),
                 ],
                 args.keep_going,
             )

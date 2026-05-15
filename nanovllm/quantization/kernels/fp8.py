@@ -57,9 +57,10 @@ def w8a16_gemm_kernel(
     for kk in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         k_mask = (kk * BLOCK_SIZE_K + offs_k) < K
         a_bf16 = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+        a_fp16 = a_bf16.to(tl.float32).to(tl.float16)
         b_fp8 = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
-        b_bf16 = b_fp8.to(tl.bfloat16)
-        acc += tl.dot(a_bf16, b_bf16, out_dtype=tl.float32)
+        b_fp16 = b_fp8.to(tl.float32).to(tl.float16)
+        acc += tl.dot(a_fp16, b_fp16, out_dtype=tl.float32)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -70,7 +71,7 @@ def w8a16_gemm_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     tl.store(
         c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :],
-        c.to(tl.bfloat16),
+        c,
         mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N),
     )
 
