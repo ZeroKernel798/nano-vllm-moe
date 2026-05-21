@@ -197,3 +197,9 @@ cython_debug/
 
 # Local Codex project skills
 skills/
+
+# md file
+agent_progress.md
+plan.md
+test.md
+todo.md

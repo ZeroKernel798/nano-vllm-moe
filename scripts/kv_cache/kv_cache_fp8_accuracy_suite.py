@@ -1,9 +1,9 @@
-"""Accuracy suite for experimental FP8 KV cache.
+"""Accuracy suite for mixed K-int8/V-FP8 KV cache.
 
-Runs BF16 KV and FP8 KV on deterministic random token prompts across seeds/prompt ids, then
+Runs BF16 KV and mixed KV on deterministic random token prompts across seeds/prompt ids, then
 summarizes divergence, logits similarity, top-k overlap, and decode timing. This script is intended
-to build a stable correctness baseline for FP8 KV kernels; it does not require token-exact match for
-long autoregressive outputs.
+to build a stable correctness baseline for the maintained mixed KV path; it does not require
+token-exact match for long autoregressive outputs.
 """
 
 from __future__ import annotations
@@ -233,10 +233,10 @@ def main() -> None:
     parser.add_argument("--max-model-len", type=int, default=2304)
     parser.add_argument("--max-num-batched-tokens", type=int, default=2304)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
-    parser.add_argument("--kv-cache-dtype", default="fp8_e4m3", choices=("fp8_e4m3", "fp8_v_only", "k_int8_v_fp8"))
+    parser.add_argument("--kv-cache-dtype", default="k_int8_v_fp8", choices=("k_int8_v_fp8",))
     parser.add_argument("--kv-cache-scale-dtype", default="float16", choices=("float16", "bfloat16", "float32"))
-    parser.add_argument("--fp8-decode-backend", default="native", choices=("native", "gather_dequant", "full_dequant"))
-    parser.add_argument("--native-block-tokens", type=int, default=64, choices=(16, 32, 64))
+    parser.add_argument("--fp8-decode-backend", default="native", choices=("native", "gather_dequant"))
+    parser.add_argument("--native-block-tokens", type=int, default=32, choices=(16, 32, 64))
     parser.add_argument("--seeds", default="0,1,2")
     parser.add_argument("--prompt-ids", default="0,1,2")
     parser.add_argument("--vocab-range", type=int, default=10000)

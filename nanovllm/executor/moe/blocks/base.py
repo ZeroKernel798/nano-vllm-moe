@@ -11,7 +11,6 @@ from nanovllm.executor.moe.experts import (
     OptimizedExperts,
     MoEExpertsKernel,
     EagerExperts,
-    FusedExperts,
 )
 from nanovllm.executor.moe.kernel import MoEKernel
 from nanovllm.executor.moe.prepare_finalize import (
@@ -20,7 +19,7 @@ from nanovllm.executor.moe.prepare_finalize import (
 )
 from nanovllm.executor.moe.router import MoERouter, SoftmaxTopKRouter
 
-MoEBackendName = Literal["eager", "optimized", "fused"]
+MoEBackendName = Literal["eager", "optimized"]
 MoEEPBackendName = Literal["torch"]
 
 
@@ -32,7 +31,7 @@ class BaseSparseMoeBlock(nn.Module):
         tp_group: Optional[dist.ProcessGroup] = None,
         ep_group: Optional[dist.ProcessGroup] = None,
         renormalize_router_weights: bool,
-        experts_backend: MoEBackendName = "fused",
+        experts_backend: MoEBackendName = "optimized",
         ep_backend: MoEEPBackendName = "torch",
         router: MoERouter | None = None,
     ) -> None:
@@ -90,8 +89,6 @@ class BaseSparseMoeBlock(nn.Module):
             return EagerExperts()
         if experts_backend == "optimized":
             return OptimizedExperts()
-        if experts_backend == "fused":
-            return FusedExperts()
         raise ValueError(f"Unsupported MoE experts backend: {experts_backend}")
 
     def load_replicated_weight(self, param, loaded_weight, **kwargs):

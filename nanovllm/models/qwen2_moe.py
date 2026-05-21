@@ -169,7 +169,7 @@ class Qwen2MoeSparseMoeBlock(BaseSparseMoeBlock):
         tp_group: Optional[dist.ProcessGroup] = None,
         ep_group: Optional[dist.ProcessGroup] = None,
         use_overlap: bool = True,
-        experts_backend: str = "fused",
+        experts_backend: str = "optimized",
         ep_backend: str = "torch",
     ) -> None:
         super().__init__(
@@ -204,17 +204,24 @@ class Qwen2MoeSparseMoeBlock(BaseSparseMoeBlock):
         x = hidden_states.view(-1, self.hidden_size).contiguous()
         topk_weights, topk_ids = self.route(x)
 
-        if self.shared_expert_stream is not None:
-            self.shared_expert_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self.shared_expert_stream):
+        # CUDA Graph capture only follows the current stream; a side stream
+        # would not be part of the captured graph and would trip "operation
+        # failed during capture". Fall back to single-stream during capture.
+        stream = self.shared_expert_stream
+        if stream is not None and torch.cuda.is_current_stream_capturing():
+            stream = None
+
+        if stream is not None:
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
                 shared_out = self._compute_shared_expert(x)
         else:
             shared_out = self._compute_shared_expert(x)
 
         sparse_out = self.apply_sparse_experts(x, topk_weights, topk_ids, reduce_tp=False)
 
-        if self.shared_expert_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.shared_expert_stream)
+        if stream is not None:
+            torch.cuda.current_stream().wait_stream(stream)
 
         output = shared_out + sparse_out
         if self.tp_size > 1:
@@ -229,7 +236,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         tp_group: Optional[dist.ProcessGroup] = None,
         ep_group: Optional[dist.ProcessGroup] = None,
         group_gemm_enable : bool = True,
-        moe_backend: str = "fused",
+        moe_backend: str = "optimized",
         moe_ep_backend: str = "torch",
     ) -> None:
         super().__init__()
@@ -287,7 +294,7 @@ class Qwen2MoeModel(nn.Module):
         config: Qwen2MoeConfig,
         tp_group=None,
         ep_group=None,
-        moe_backend: str = "fused",
+        moe_backend: str = "optimized",
         moe_ep_backend: str = "torch",
     ) -> None:
         super().__init__()
@@ -332,7 +339,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         config: Qwen2MoeConfig, 
         tp_group: Optional[dist.ProcessGroup] = None, 
         ep_group: Optional[dist.ProcessGroup] = None,
-        moe_backend: str = "fused",
+        moe_backend: str = "optimized",
         moe_ep_backend: str = "torch",
         **kwargs 
     ) -> None:

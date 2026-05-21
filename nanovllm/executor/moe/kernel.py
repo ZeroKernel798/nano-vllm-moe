@@ -36,7 +36,7 @@ class MoEKernel:
         w13_weight_scale: torch.Tensor | None = None,
         w2_weight_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        profile = os.environ.get("NANOVLLM_MOE_PROFILE", "0") == "1"
+        profile = os.environ.get("NANOVLLM_MOE_PROFILE", "0") == "1" and not torch.cuda.is_current_stream_capturing()
         if profile and torch.cuda.is_available():
             torch.cuda.synchronize()
         start = time.perf_counter() if profile else 0.0

@@ -1,50 +1,24 @@
-"""KV cache dtype helpers and roadmap for quantized KV.
+"""KV cache dtype helpers.
 
-Why FlashAttention blocks a one-line FP8 switch
------------------------------------------------
-``flash_attn.flash_attn_with_kvcache`` / ``flash_attn_varlen_func`` (CUDA backend) expect
-``k_cache`` / ``v_cache`` in **float16 or bfloat16** with contiguous last dimension. There is
-no supported path in the stock wheel to pass **FP8 paged KV** into the same kernels without
-either:
+Only two storage modes are kept in the active code path:
 
-1. **Full-sequence dequant** bf16 → FA each decode step (**O(seq × layers)** extra work and
-   bandwidth), which negates decode wins unless sequence length is tiny, or
-2. **Native FP8 KV inside the attention kernel** (custom CUDA / upstream FlashAttention support),
-   or
-3. A **decode-only** attention implementation (e.g. Triton) that reads FP8 from the paged
-   layout directly in registers.
+* ``bf16``: production/reference FlashAttention KV cache.
+* ``k_int8_v_fp8``: mixed KV quantization, with K stored as group-wise int8 and V stored as
+  FP8 E4M3.
+* ``fp8``: debug-only full FP8 KV with per-token/per-head K/V scales.
 
-So “reliable” GPU KV quantization in this codebase is a **multi-phase** project: memory
-accounting and storage format first, then either upstream kernel support or a dedicated decode
-path.
-
-Recommended phases
------------------
-**Phase A — Infra (done here):** ``Config.kv_cache_dtype``, bytes-per-element for block budget,
-runtime guard so only implemented modes run.
-
-**Phase B — Storage format:** FP8 (or int8) buffers with the **same paged shape** as today
-``[num_blocks, block_size, num_kv_heads, head_dim]``, plus optional scale tensor(s). Implement
-``store_kvcache_*`` that quantizes on write (see ``layers/kv_cache_kernels.py`` sketch).
-
-**Phase C — Prefill:** Prefix / long prefill may require **dequant** of cached KV to bf16 for
-``flash_attn_varlen_func`` *or* a varlen kernel that accepts FP8 — measure cost; prefill is often
-more tolerant than decode.
-
-**Phase D — Decode:** Either integrate a library that supports FP8 KV + paged attention on your
-GPU, or add a **batch=1 / small-batch** Triton decode that matches GQA layout and block tables.
-
-Until Phase D is satisfied, keep ``kv_cache_dtype="bf16"`` for production inference. The
-experimental FP8 path intentionally dequantizes back to BF16 before FlashAttention so it can
-verify memory accounting and accuracy without claiming decode speedups.
+Full FP8 KV, V-only FP8, and fake-quant diagnostic paths were removed from the runtime. Their
+reasoning is documented in ``opt/kv_cache_quant.md``: full FP8 K caused attention-score drift,
+while V-only FP8 was useful for ablation but not enough for the final memory story.
 """
 
 from __future__ import annotations
 
+import os
+
 KV_CACHE_DTYPES_BF16 = frozenset({"bf16", "bfloat16"})
-KV_CACHE_DTYPES_FP8 = frozenset({"fp8", "fp8_e4m3", "float8_e4m3fn"})
-KV_CACHE_DTYPES_FP8_V_ONLY = frozenset({"fp8_v_only", "v_fp8", "v8"})
 KV_CACHE_DTYPES_K_INT8_V_FP8 = frozenset({"k_int8_v_fp8", "int8_k_fp8_v", "kv_int8_fp8"})
+KV_CACHE_DTYPES_FP8 = frozenset({"fp8", "fp8_e4m3", "fp8_kv", "kv_fp8"})
 KV_CACHE_SCALE_DTYPES = {
     "fp32": "float32",
     "float32": "float32",
@@ -59,12 +33,10 @@ def normalize_kv_cache_dtype(name: str) -> str:
     n = name.strip().lower()
     if n in ("bf16", "bfloat16"):
         return "bf16"
-    if n in KV_CACHE_DTYPES_FP8:
-        return "fp8_e4m3"
-    if n in KV_CACHE_DTYPES_FP8_V_ONLY:
-        return "fp8_v_only"
     if n in KV_CACHE_DTYPES_K_INT8_V_FP8:
         return "k_int8_v_fp8"
+    if n in KV_CACHE_DTYPES_FP8:
+        return "fp8"
     raise ValueError(f"Unknown kv_cache_dtype: {name!r}")
 
 
@@ -75,6 +47,23 @@ def kv_cache_scale_dtype_bytes_per_element(kv_cache_scale_dtype: str) -> int:
     if n in {"float16", "bfloat16"}:
         return 2
     raise AssertionError(f"Unhandled kv_cache_scale_dtype: {n}")
+
+
+def k_int8_group_size_from_env(head_dim: int) -> int:
+    group_size = int(os.environ.get("NANOVLLM_K_INT8_GROUP_SIZE", "32"))
+    if group_size <= 0 or head_dim % group_size != 0:
+        raise ValueError(
+            "NANOVLLM_K_INT8_GROUP_SIZE must be a positive divisor of head_dim, "
+            f"got group_size={group_size}, head_dim={head_dim}."
+        )
+    return group_size
+
+
+def k_int8_recent_bf16_window_from_env() -> int:
+    window = int(os.environ.get("NANOVLLM_K_INT8_RECENT_BF16_WINDOW", "0"))
+    if window < 0:
+        raise ValueError(f"NANOVLLM_K_INT8_RECENT_BF16_WINDOW must be >= 0, got {window}.")
+    return window
 
 
 def normalize_kv_cache_scale_dtype(name: str) -> str:
@@ -89,7 +78,9 @@ def kv_cache_bytes_per_element(kv_cache_dtype: str) -> int:
     n = normalize_kv_cache_dtype(kv_cache_dtype)
     if n == "bf16":
         return 2
-    if n in {"fp8_e4m3", "fp8_v_only", "k_int8_v_fp8"}:
+    if n == "k_int8_v_fp8":
+        return 1
+    if n == "fp8":
         return 1
     raise AssertionError
 
@@ -104,7 +95,7 @@ def assert_kv_cache_runtime_supported(kv_cache_dtype: str, experimental_fp8: boo
     if not kv_cache_runtime_supported(kv_cache_dtype) and not experimental_fp8:
         raise NotImplementedError(
             f'kv_cache_dtype={kv_cache_dtype!r} is not implemented yet. '
-            f'Only "bf16" is production-supported with the current FlashAttention path. '
-            f'Pass experimental_kv_cache_fp8=True to use the slow FP8-store/BF16-dequant path. '
-            f'See nanovllm.utils.kv_cache module docstring for the rollout plan.'
+            f'Only "bf16" is production-supported by default. '
+            f'Pass experimental_kv_cache_fp8=True to use the K-int8/V-FP8 mixed KV or debug full-FP8 path. '
+            f'See opt/kv_cache_quant.md for the current route.'
         )

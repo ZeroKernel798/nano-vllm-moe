@@ -103,6 +103,19 @@ def load_calibration_texts(config: CalibrationConfig) -> list[str]:
         return [text for text in texts if text][: config.samples]
     from datasets import load_dataset
 
+    raw_dir = Path(config.cache_dir).expanduser() / "_raw" / config.dataset_config if config.cache_dir else None
+    if raw_dir is not None and raw_dir.exists():
+        split_files = sorted(raw_dir.glob(f"{config.split}-*.parquet"))
+        if split_files:
+            raw = load_dataset("parquet", data_files={config.split: [str(path) for path in split_files]}, split=config.split)
+            texts = []
+            for text in raw[config.text_column]:
+                if text and text.strip():
+                    texts.append(text.strip())
+                if len(texts) >= config.samples:
+                    break
+            return texts
+
     load_kwargs = {}
     if config.cache_dir:
         load_kwargs["cache_dir"] = str(Path(config.cache_dir).expanduser())

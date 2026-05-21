@@ -15,7 +15,7 @@ from transformers import AutoConfig
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from nanovllm.executor.moe.config import make_moe_parallel_config
-from nanovllm.executor.moe.experts import OptimizedExperts, EagerExperts, FusedExperts
+from nanovllm.executor.moe.experts import OptimizedExperts, EagerExperts
 from nanovllm.executor.moe.kernel import MoEKernel
 from nanovllm.executor.moe.prepare_finalize import NoEPPrepareFinalize
 
@@ -23,7 +23,6 @@ from nanovllm.executor.moe.prepare_finalize import NoEPPrepareFinalize
 BACKENDS = {
     "eager": EagerExperts,
     "optimized": OptimizedExperts,
-    "fused": FusedExperts,
 }
 
 
@@ -202,7 +201,7 @@ def write_csv(path: str, rows: list[dict]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Synthetic single-device MoE local compute benchmark")
-    parser.add_argument("--backends", default="eager,optimized,fused")
+    parser.add_argument("--backends", default="eager,optimized")
     parser.add_argument("--num-tokens", default="1,8,32,128,512,1024,2048,4096,8192")
     parser.add_argument("--model-config", default="")
     parser.add_argument("--hidden-size", type=int, default=512)

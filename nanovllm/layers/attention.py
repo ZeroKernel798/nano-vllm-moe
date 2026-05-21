@@ -1,4 +1,4 @@
-"""Multi-head attention with paged KV, FlashAttention, and experimental FP8 KV cache."""
+"""Multi-head attention with paged KV, FlashAttention, and mixed KV cache."""
 
 import os
 
@@ -8,20 +8,17 @@ import triton.language as tl
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from torch import nn
 
-from nanovllm.layers.fp8_paged_attention import fp8_paged_attention_decode, k_int8_v_fp8_paged_attention_decode
+from nanovllm.layers.fp8_paged_attention import k_int8_v_fp8_paged_attention_decode
 from nanovllm.layers.kv_cache_kernels import (
-    dequant_kvcache_fp8_gather_decode,
+    dequant_fp8_kvcache_gather_decode,
+    dequant_fp8_kvcache_slice,
     dequant_k_int8_vcache_fp8_gather_decode,
     dequant_k_int8_vcache_fp8_slice,
-    dequant_kvcache_fp8_slice,
-    dequant_vcache_fp8_slice,
-    store_kvcache_fake_fp8,
-    store_kvcache_fp8,
-    store_kvcache_k_int8_v_fp8,
+    store_kvcache_fp8_triton,
     store_kvcache_k_int8_v_fp8_triton,
-    store_kvcache_v_fp8,
 )
 from nanovllm.utils.context import get_context
+from nanovllm.utils.kv_cache import k_int8_group_size_from_env, k_int8_recent_bf16_window_from_env
 from nanovllm.utils.kv_cache_profile import timed_kv_cache_profile
 
 
@@ -79,6 +76,7 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        self.k_bf16_shadow_cache = torch.tensor([])
         self.k_scale_cache = self.v_scale_cache = torch.tensor([])
         self._fp8_kv_gather_workspace: tuple[torch.Tensor, torch.Tensor] | None = None
 
@@ -109,78 +107,102 @@ class Attention(nn.Module):
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        fp8_cache = k_cache.dtype == torch.float8_e4m3fn if k_cache.numel() else False
+        k_bf16_shadow_cache = self.k_bf16_shadow_cache
         v_fp8_cache = v_cache.dtype == torch.float8_e4m3fn if v_cache.numel() else False
         k_int8_cache = k_cache.dtype == torch.int8 if k_cache.numel() else False
+        mixed_kv_cache = k_int8_cache and v_fp8_cache
+        full_fp8_kv_cache = v_fp8_cache and k_cache.dtype == torch.float8_e4m3fn if k_cache.numel() else False
         kv_profile = os.environ.get("NANOVLLM_KV_CACHE_PROFILE", "0") == "1"
-        fake_fp8_store_mode = os.environ.get("NANOVLLM_KV_FAKE_FP8_STORE", "").strip().lower()
         fp8_decode_backend = os.environ.get("NANOVLLM_FP8_KV_DECODE", "native")
         if k_cache.numel() and v_cache.numel():
-            if fp8_cache:
-                store = lambda: store_kvcache_fp8(
-                    k, v, k_cache, v_cache, self.k_scale_cache, self.v_scale_cache, context.slot_mapping
+            if mixed_kv_cache:
+                k_group_size = k_int8_group_size_from_env(self.head_dim)
+                store = lambda: store_kvcache_k_int8_v_fp8_triton(
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    self.k_scale_cache,
+                    self.v_scale_cache,
+                    context.slot_mapping,
+                    k_group_size=k_group_size,
                 )
                 if kv_profile:
-                    timed_kv_cache_profile("fp8_store", store)
+                    timed_kv_cache_profile("k_int8_v_fp8_store_triton", store)
                 else:
                     store()
-            elif k_int8_cache and v_fp8_cache:
-                if os.environ.get("NANOVLLM_K_INT8_V_FP8_STORE", "triton").strip().lower() == "torch":
-                    store = lambda: store_kvcache_k_int8_v_fp8(
-                        k, v, k_cache, v_cache, self.k_scale_cache, self.v_scale_cache, context.slot_mapping
-                    )
-                    store_profile_name = "k_int8_v_fp8_store_torch"
-                else:
-                    store = lambda: store_kvcache_k_int8_v_fp8_triton(
-                        k, v, k_cache, v_cache, self.k_scale_cache, self.v_scale_cache, context.slot_mapping
-                    )
-                    store_profile_name = "k_int8_v_fp8_store_triton"
+                if k_bf16_shadow_cache.numel():
+                    shadow_store = lambda: store_kvcache(k, k, k_bf16_shadow_cache, k_bf16_shadow_cache, context.slot_mapping)
+                    if kv_profile:
+                        timed_kv_cache_profile("k_bf16_shadow_store", shadow_store)
+                    else:
+                        shadow_store()
+            elif full_fp8_kv_cache:
+                store = lambda: store_kvcache_fp8_triton(
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    self.k_scale_cache,
+                    self.v_scale_cache,
+                    context.slot_mapping,
+                )
                 if kv_profile:
-                    timed_kv_cache_profile(store_profile_name, store)
-                else:
-                    store()
-            elif v_fp8_cache:
-                store = lambda: store_kvcache_v_fp8(k, v, k_cache, v_cache, self.v_scale_cache, context.slot_mapping)
-                if kv_profile:
-                    timed_kv_cache_profile("v_fp8_store", store)
+                    timed_kv_cache_profile("fp8_kv_store_triton", store)
                 else:
                     store()
             else:
-                if fake_fp8_store_mode:
-                    store = lambda: store_kvcache_fake_fp8(k, v, k_cache, v_cache, context.slot_mapping, fake_fp8_store_mode)
-                    profile_name = f"bf16_store_fake_fp8_{fake_fp8_store_mode}"
-                else:
-                    store = lambda: store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
-                    profile_name = "bf16_store"
+                store = lambda: store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
                 if kv_profile:
-                    timed_kv_cache_profile(profile_name, store)
+                    timed_kv_cache_profile("bf16_store", store)
                 else:
                     store()
         if context.is_prefill:
             if context.block_tables is not None:  # prefix cache
-                if fp8_cache:
-                    dequant = lambda: dequant_kvcache_fp8_slice(
-                        k_cache, v_cache, self.k_scale_cache, self.v_scale_cache
-                    )
-                    if kv_profile:
-                        k_cache, v_cache = timed_kv_cache_profile("fp8_prefill_dequant_full_cache", dequant)
-                    else:
-                        k_cache, v_cache = dequant()
-                elif k_int8_cache and v_fp8_cache:
-                    dequant = lambda: dequant_k_int8_vcache_fp8_slice(
-                        k_cache, v_cache, self.k_scale_cache, self.v_scale_cache
-                    )
+                if mixed_kv_cache or full_fp8_kv_cache:
+                    def dequant():
+                        if context.block_tables.shape[0] == 1:
+                            context_lens = torch.tensor(
+                                [context.max_seqlen_k], dtype=torch.int32, device=q.device
+                            )
+                            k_workspace, v_workspace = self._get_fp8_kv_gather_workspace(
+                                1, context.max_seqlen_k, q.dtype, q.device
+                            )
+                            gather_fn = dequant_k_int8_vcache_fp8_gather_decode if mixed_kv_cache else dequant_fp8_kvcache_gather_decode
+                            return gather_fn(
+                                k_cache,
+                                v_cache,
+                                self.k_scale_cache,
+                                self.v_scale_cache,
+                                context.block_tables,
+                                context_lens,
+                                q.dtype,
+                                k_workspace,
+                                v_workspace,
+                            )
+                        if mixed_kv_cache:
+                            return dequant_k_int8_vcache_fp8_slice(
+                                k_cache, v_cache, self.k_scale_cache, self.v_scale_cache
+                            )
+                        return dequant_fp8_kvcache_slice(
+                            k_cache, v_cache, self.k_scale_cache, self.v_scale_cache
+                        )
+
                     if kv_profile:
                         k_cache, v_cache = timed_kv_cache_profile("k_int8_v_fp8_prefill_dequant_full_cache", dequant)
                     else:
                         k_cache, v_cache = dequant()
-                elif v_fp8_cache:
-                    dequant_v = lambda: dequant_vcache_fp8_slice(v_cache, self.v_scale_cache)
-                    if kv_profile:
-                        v_cache = timed_kv_cache_profile("v_fp8_prefill_dequant_full_cache", dequant_v)
+                    if context.block_tables.shape[0] == 1:
+                        k_cache = k_cache[0, : context.max_seqlen_k]
+                        v_cache = v_cache[0, : context.max_seqlen_k]
+                        block_tables = None
                     else:
-                        v_cache = dequant_v()
+                        block_tables = context.block_tables
+                else:
+                    block_tables = context.block_tables
                 k, v = k_cache, v_cache
+            else:
+                block_tables = None
             o = flash_attn_varlen_func(
                 q,
                 k,
@@ -191,13 +213,13 @@ class Attention(nn.Module):
                 cu_seqlens_k=context.cu_seqlens_k,
                 softmax_scale=self.scale,
                 causal=True,
-                block_table=context.block_tables,
+                block_table=block_tables,
             )
         else:  # decode
             decode_block_table = context.block_tables
-            if k_int8_cache and v_fp8_cache:
+            if mixed_kv_cache:
                 if fp8_decode_backend == "native" and q.size(0) == 1 and context.context_lens.numel() == 1:
-                    block_tokens = int(os.environ.get("NANOVLLM_FP8_KV_NATIVE_BLOCK_TOKENS", "64"))
+                    block_tokens = int(os.environ.get("NANOVLLM_FP8_KV_NATIVE_BLOCK_TOKENS", "32"))
 
                     def native_decode():
                         return k_int8_v_fp8_paged_attention_decode(
@@ -239,74 +261,54 @@ class Attention(nn.Module):
                         k_cache, v_cache = timed_kv_cache_profile("k_int8_v_fp8_decode_gather_dequant", dequant)
                     else:
                         k_cache, v_cache = dequant()
+                    recent_k_window = k_int8_recent_bf16_window_from_env()
+                    if recent_k_window > 0 and k_bf16_shadow_cache.numel():
+                        context_lens_cpu = context.context_lens.tolist()
+                        for batch_idx, context_len in enumerate(context_lens_cpu):
+                            start = max(0, int(context_len) - recent_k_window)
+                            if start >= int(context_len):
+                                continue
+                            token_offsets = torch.arange(
+                                start,
+                                int(context_len),
+                                device=context.block_tables.device,
+                                dtype=torch.int64,
+                            )
+                            block_size = k_bf16_shadow_cache.shape[1]
+                            logical_blocks = token_offsets // block_size
+                            block_offsets = token_offsets % block_size
+                            physical_blocks = context.block_tables[batch_idx, logical_blocks].long()
+                            k_cache[batch_idx, start:int(context_len)].copy_(
+                                k_bf16_shadow_cache[physical_blocks, block_offsets]
+                            )
                     decode_block_table = None
                 else:
-                    dequant = lambda: dequant_k_int8_vcache_fp8_slice(
-                        k_cache, v_cache, self.k_scale_cache, self.v_scale_cache
+                    raise ValueError(
+                        "NANOVLLM_FP8_KV_DECODE must be one of {'native', 'gather_dequant'} "
+                        f"for k_int8_v_fp8, got {fp8_decode_backend!r}"
                     )
-                    if kv_profile:
-                        k_cache, v_cache = timed_kv_cache_profile("k_int8_v_fp8_decode_dequant_full_cache", dequant)
-                    else:
-                        k_cache, v_cache = dequant()
-            elif v_fp8_cache and not fp8_cache:
-                dequant_v = lambda: dequant_vcache_fp8_slice(v_cache, self.v_scale_cache)
+            elif full_fp8_kv_cache:
+                def dequant():
+                    max_context_len = int(context.context_lens.max().item())
+                    k_workspace, v_workspace = self._get_fp8_kv_gather_workspace(
+                        context.context_lens.numel(), max_context_len, q.dtype, q.device
+                    )
+                    return dequant_fp8_kvcache_gather_decode(
+                        k_cache,
+                        v_cache,
+                        self.k_scale_cache,
+                        self.v_scale_cache,
+                        context.block_tables,
+                        context.context_lens,
+                        q.dtype,
+                        k_workspace,
+                        v_workspace,
+                    )
                 if kv_profile:
-                    v_cache = timed_kv_cache_profile("v_fp8_decode_dequant_full_cache", dequant_v)
+                    k_cache, v_cache = timed_kv_cache_profile("fp8_kv_decode_gather_dequant", dequant)
                 else:
-                    v_cache = dequant_v()
-            if fp8_cache:
-                if fp8_decode_backend == "native" and q.size(0) == 1 and context.context_lens.numel() == 1:
-                    block_tokens = int(os.environ.get("NANOVLLM_FP8_KV_NATIVE_BLOCK_TOKENS", "64"))
-
-                    def native_decode():
-                        return fp8_paged_attention_decode(
-                            q[0],
-                            k_cache,
-                            v_cache,
-                            self.k_scale_cache,
-                            self.v_scale_cache,
-                            context.block_tables[0],
-                            context.context_lens[:1],
-                            self.scale,
-                            block_tokens=block_tokens,
-                        ).unsqueeze(0)
-
-                    if kv_profile:
-                        o = timed_kv_cache_profile("fp8_decode_native_paged_attention", native_decode)
-                    else:
-                        o = native_decode()
-                    o = o.view(-1, self.num_heads * self.head_dim)
-                    return o
-                if fp8_decode_backend in {"native", "gather_dequant"}:
-                    def dequant():
-                        max_context_len = int(context.context_lens.max().item())
-                        k_workspace, v_workspace = self._get_fp8_kv_gather_workspace(
-                            context.context_lens.numel(), max_context_len, q.dtype, q.device
-                        )
-                        return dequant_kvcache_fp8_gather_decode(
-                            k_cache,
-                            v_cache,
-                            self.k_scale_cache,
-                            self.v_scale_cache,
-                            context.block_tables,
-                            context.context_lens,
-                            q.dtype,
-                            k_workspace,
-                            v_workspace,
-                        )
-                    if kv_profile:
-                        k_cache, v_cache = timed_kv_cache_profile("fp8_decode_gather_dequant", dequant)
-                    else:
-                        k_cache, v_cache = dequant()
-                    decode_block_table = None
-                else:
-                    dequant = lambda: dequant_kvcache_fp8_slice(
-                        k_cache, v_cache, self.k_scale_cache, self.v_scale_cache
-                    )
-                    if kv_profile:
-                        k_cache, v_cache = timed_kv_cache_profile("fp8_decode_dequant_full_cache", dequant)
-                    else:
-                        k_cache, v_cache = dequant()
+                    k_cache, v_cache = dequant()
+                decode_block_table = None
             flash_decode = lambda: flash_attn_with_kvcache(
                 q.unsqueeze(1), k_cache, v_cache, cache_seqlens=context.context_lens,
                 block_table=decode_block_table, softmax_scale=self.scale, causal=True,

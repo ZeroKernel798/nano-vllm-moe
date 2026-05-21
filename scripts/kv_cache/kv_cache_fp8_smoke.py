@@ -1,8 +1,7 @@
-"""Smoke-test experimental FP8 KV cache storage and decode backends.
+"""Smoke-test mixed K-int8/V-FP8 KV cache storage and decode.
 
-This script compares BF16 KV cache against FP8 storage with a selectable decode backend. The
-default FP8 backend is native paged decode for batch=1, with gather-dequant fallback for unsupported
-shapes.
+This script compares BF16 KV cache against the maintained mixed KV path. The native backend reads
+K-int8/V-FP8 directly for batch=1 decode; gather-dequant is kept as a reference fallback.
 """
 
 from __future__ import annotations
@@ -157,7 +156,7 @@ def _compare_results(bf16: list[list[int]], fp8: list[list[int]]) -> dict[str, A
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Experimental FP8 KV cache memory/accuracy smoke")
+    parser = argparse.ArgumentParser(description="K-int8/V-FP8 KV cache memory/accuracy smoke")
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--label", default="kv_cache_fp8_smoke")
     parser.add_argument("--num-seqs", type=int, default=1)
@@ -169,10 +168,10 @@ def main() -> None:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--ep-size", type=int, default=1)
-    parser.add_argument("--kv-cache-dtype", default="fp8_e4m3", choices=("fp8_e4m3", "fp8_v_only", "k_int8_v_fp8"))
+    parser.add_argument("--kv-cache-dtype", default="k_int8_v_fp8", choices=("k_int8_v_fp8",))
     parser.add_argument("--kv-cache-scale-dtype", default="float16", choices=("float16", "bfloat16", "float32"))
-    parser.add_argument("--fp8-decode-backend", default="native", choices=("native", "gather_dequant", "full_dequant"))
-    parser.add_argument("--native-block-tokens", type=int, default=64, choices=(16, 32, 64))
+    parser.add_argument("--fp8-decode-backend", default="native", choices=("native", "gather_dequant"))
+    parser.add_argument("--native-block-tokens", type=int, default=32, choices=(16, 32, 64))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--vocab-range", type=int, default=10000)
     parser.add_argument("--output-json")
@@ -180,8 +179,8 @@ def main() -> None:
     args.model_path = os.path.expanduser(args.model_path)
 
     bf16 = _run_once(args, "bf16", False)
-    fp8 = _run_once(args, args.kv_cache_dtype, True)
-    comparison = _compare_results(bf16["results"], fp8["results"])
+    quant = _run_once(args, args.kv_cache_dtype, True)
+    comparison = _compare_results(bf16["results"], quant["results"])
     summary = {
         "label": args.label,
         "model_path": args.model_path,
@@ -189,13 +188,13 @@ def main() -> None:
         "output_len": args.output_len,
         "num_seqs": args.num_seqs,
         "bf16": bf16,
-        args.kv_cache_dtype: fp8,
+        args.kv_cache_dtype: quant,
         "comparison": comparison,
-        "data_storage_ratio_quant_over_bf16": fp8["kv_cache_data_storage_bytes"] / bf16["kv_cache_data_storage_bytes"],
-        "total_storage_ratio_quant_over_bf16": fp8["kv_cache_total_storage_bytes"] / bf16["kv_cache_total_storage_bytes"],
-        "data_bytes_per_block_ratio_quant_over_bf16": fp8["kv_cache_data_bytes_per_block"] / bf16["kv_cache_data_bytes_per_block"],
-        "total_bytes_per_block_ratio_quant_over_bf16": fp8["kv_cache_total_bytes_per_block"] / bf16["kv_cache_total_bytes_per_block"],
-        "block_ratio_quant_over_bf16": fp8["num_kvcache_blocks"] / bf16["num_kvcache_blocks"],
+        "data_storage_ratio_quant_over_bf16": quant["kv_cache_data_storage_bytes"] / bf16["kv_cache_data_storage_bytes"],
+        "total_storage_ratio_quant_over_bf16": quant["kv_cache_total_storage_bytes"] / bf16["kv_cache_total_storage_bytes"],
+        "data_bytes_per_block_ratio_quant_over_bf16": quant["kv_cache_data_bytes_per_block"] / bf16["kv_cache_data_bytes_per_block"],
+        "total_bytes_per_block_ratio_quant_over_bf16": quant["kv_cache_total_bytes_per_block"] / bf16["kv_cache_total_bytes_per_block"],
+        "block_ratio_quant_over_bf16": quant["num_kvcache_blocks"] / bf16["num_kvcache_blocks"],
     }
     text = json.dumps(summary, indent=2, ensure_ascii=False)
     print(text)

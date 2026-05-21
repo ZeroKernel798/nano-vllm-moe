@@ -116,6 +116,11 @@ class LLMEngine:
         final_outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
         if use_tqdm: pbar.close()
 
+        # 收集 prefix cache stats
+        prefix_cache_stats = self.scheduler.block_manager.stats.to_dict()
+        # 重置 stats 以便下一次 benchmark
+        self.scheduler.block_manager.stats.reset()
+
         # 返回包含统计信息的字典
         return {
             "results": final_outputs,
@@ -123,6 +128,7 @@ class LLMEngine:
                 "prefill_tps": stats["prefill_tokens"] / max(stats["prefill_time"], 1e-6),
                 "decode_tps": stats["decode_tokens"] / max(stats["decode_time"], 1e-6),
                 "avg_ttft_ms": (stats["ttft_sum"] / len(prompts)) * 1000,
-                "total_time": perf_counter() - start_time
+                "total_time": perf_counter() - start_time,
+                "prefix_cache": prefix_cache_stats,
             }
         }

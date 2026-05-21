@@ -112,7 +112,7 @@ class Qwen3MoeSparseMoeBlock(BaseSparseMoeBlock):
         config,
         tp_group: Optional[dist.ProcessGroup] = None,
         ep_group: Optional[dist.ProcessGroup] = None,
-        experts_backend: str = "fused",
+        experts_backend: str = "optimized",
         ep_backend: str = "torch",
     ) -> None:
         super().__init__(
@@ -139,7 +139,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         tp_group: Optional[dist.ProcessGroup] = None,
         ep_group: Optional[dist.ProcessGroup] = None,
         group_gemm_enable: bool = True,
-        moe_backend: str = "fused",
+        moe_backend: str = "optimized",
         moe_ep_backend: str = "torch",
     ) -> None:
         super().__init__()
@@ -202,7 +202,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
 
 class Qwen3MoeModel(nn.Module):
-    def __init__(self, config, tp_group=None, ep_group=None, moe_backend: str = "fused", moe_ep_backend: str = "torch") -> None:
+    def __init__(self, config, tp_group=None, ep_group=None, moe_backend: str = "optimized", moe_ep_backend: str = "torch") -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, tp_group=tp_group
@@ -245,7 +245,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         config, 
         tp_group: Optional[dist.ProcessGroup] = None, 
         ep_group: Optional[dist.ProcessGroup] = None,
-        moe_backend: str = "fused",
+        moe_backend: str = "optimized",
         moe_ep_backend: str = "torch",
         **kwargs 
     ) -> None:

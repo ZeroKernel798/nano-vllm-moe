@@ -22,6 +22,8 @@ def add_generation_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vocab-size", type=int, default=10000)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--max-model-len", type=int, default=128)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
+    parser.add_argument("--max-num-seqs", type=int, default=None)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--ep-size", type=int, default=1)
     parser.add_argument("--enforce-eager", action="store_true")
@@ -30,14 +32,18 @@ def add_generation_args(parser: argparse.ArgumentParser) -> None:
 
 
 def build_llm(model_path: str, args: argparse.Namespace) -> LLM:
-    return LLM(
-        str(Path(model_path).expanduser()),
-        enforce_eager=args.enforce_eager,
-        max_model_len=args.max_model_len,
-        tp_size=args.tp_size,
-        ep_size=args.ep_size,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-    )
+    kwargs = {
+        "enforce_eager": args.enforce_eager,
+        "max_model_len": args.max_model_len,
+        "tp_size": args.tp_size,
+        "ep_size": args.ep_size,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+    }
+    if args.max_num_batched_tokens is not None:
+        kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+    if args.max_num_seqs is not None:
+        kwargs["max_num_seqs"] = args.max_num_seqs
+    return LLM(str(Path(model_path).expanduser()), **kwargs)
 
 
 def make_token_batch(args: argparse.Namespace, repeat_index: int) -> tuple[list[list[int]], list[SamplingParams]]:

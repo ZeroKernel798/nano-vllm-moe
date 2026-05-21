@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import torch
 import triton
 import triton.language as tl
 
@@ -196,4 +197,160 @@ def launch_fused_moe_kernel(
         top_k=top_k,
         compute_type=compute_type,
         even_Ks=input_dim % config["BLOCK_SIZE_K"] == 0,
+    )
+
+
+@triton.jit
+def token_moe_w13_kernel(
+    x_ptr,
+    w13_ptr,
+    gate_up_ptr,
+    topk_ids_ptr,
+    M: tl.constexpr,
+    I: tl.constexpr,
+    H: tl.constexpr,
+    stride_xm,
+    stride_xh,
+    stride_we,
+    stride_wn,
+    stride_wh,
+    stride_gm,
+    stride_gn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    n_block = tl.program_id(1)
+    offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    expert_id = tl.load(topk_ids_ptr + token_id).to(tl.int64)
+
+    gate_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    up_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    x_base = x_ptr + token_id * stride_xm
+    gate_base = w13_ptr + expert_id * stride_we
+    up_base = gate_base + I * stride_wn
+    for k in range(0, tl.cdiv(H, BLOCK_K)):
+        k_offsets = k * BLOCK_K + offs_k
+        x = tl.load(x_base + k_offsets * stride_xh, mask=k_offsets < H, other=0.0)
+        gate_w = tl.load(
+            gate_base + offs_n[:, None] * stride_wn + k_offsets[None, :] * stride_wh,
+            mask=(offs_n[:, None] < I) & (k_offsets[None, :] < H),
+            other=0.0,
+        )
+        up_w = tl.load(
+            up_base + offs_n[:, None] * stride_wn + k_offsets[None, :] * stride_wh,
+            mask=(offs_n[:, None] < I) & (k_offsets[None, :] < H),
+            other=0.0,
+        )
+        gate_acc += tl.sum(gate_w * x[None, :], axis=1)
+        up_acc += tl.sum(up_w * x[None, :], axis=1)
+
+    tl.store(
+        gate_up_ptr + token_id * stride_gm + offs_n * stride_gn,
+        gate_acc.to(gate_up_ptr.dtype.element_ty),
+        mask=offs_n < I,
+    )
+    tl.store(
+        gate_up_ptr + token_id * stride_gm + (I + offs_n) * stride_gn,
+        up_acc.to(gate_up_ptr.dtype.element_ty),
+        mask=offs_n < I,
+    )
+
+
+@triton.jit
+def token_moe_w2_kernel(
+    activated_ptr,
+    w2_ptr,
+    output_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    M: tl.constexpr,
+    I: tl.constexpr,
+    H: tl.constexpr,
+    stride_am,
+    stride_ai,
+    stride_we,
+    stride_wh,
+    stride_wi,
+    stride_om,
+    stride_oh,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    n_block = tl.program_id(1)
+    offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    expert_id = tl.load(topk_ids_ptr + token_id).to(tl.int64)
+    route_weight = tl.load(topk_weights_ptr + token_id).to(tl.float32)
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    a_base = activated_ptr + token_id * stride_am
+    w_base = w2_ptr + expert_id * stride_we
+    for k in range(0, tl.cdiv(I, BLOCK_K)):
+        k_offsets = k * BLOCK_K + offs_k
+        a = tl.load(a_base + k_offsets * stride_ai, mask=k_offsets < I, other=0.0)
+        w = tl.load(
+            w_base + offs_n[:, None] * stride_wh + k_offsets[None, :] * stride_wi,
+            mask=(offs_n[:, None] < H) & (k_offsets[None, :] < I),
+            other=0.0,
+        )
+        acc += tl.sum(w * a[None, :], axis=1)
+
+    acc = acc * route_weight
+    tl.store(
+        output_ptr + token_id * stride_om + offs_n * stride_oh,
+        acc.to(output_ptr.dtype.element_ty),
+        mask=offs_n < H,
+    )
+
+
+def launch_token_moe_graph_kernel(hidden_states, topk_ids, topk_weights, w13, w2, output, *, intermediate_size: int) -> None:
+    m_tokens = hidden_states.shape[0]
+    hidden_size = hidden_states.shape[1]
+    gate_up = torch.empty((m_tokens, 2 * intermediate_size), device=hidden_states.device, dtype=hidden_states.dtype)
+    block_n = 32
+    block_k = 64
+    grid_w13 = (m_tokens, triton.cdiv(intermediate_size, block_n))
+    token_moe_w13_kernel[grid_w13](
+        hidden_states,
+        w13,
+        gate_up,
+        topk_ids,
+        m_tokens,
+        intermediate_size,
+        hidden_size,
+        hidden_states.stride(0),
+        hidden_states.stride(1),
+        w13.stride(0),
+        w13.stride(1),
+        w13.stride(2),
+        gate_up.stride(0),
+        gate_up.stride(1),
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+    )
+    gate, up = gate_up.chunk(2, dim=-1)
+    activated = torch.nn.functional.silu(gate) * up
+    activated = activated.contiguous()
+    grid_w2 = (m_tokens, triton.cdiv(hidden_size, block_n))
+    token_moe_w2_kernel[grid_w2](
+        activated,
+        w2,
+        output,
+        topk_ids,
+        topk_weights,
+        m_tokens,
+        intermediate_size,
+        hidden_size,
+        activated.stride(0),
+        activated.stride(1),
+        w2.stride(0),
+        w2.stride(1),
+        w2.stride(2),
+        output.stride(0),
+        output.stride(1),
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
     )

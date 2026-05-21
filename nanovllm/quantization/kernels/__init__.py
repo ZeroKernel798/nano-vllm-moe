@@ -1,6 +1,5 @@
 from nanovllm.quantization.kernels.fp8 import (
     launch_scaled_mm_w8a8,
-    launch_w8a8_fused_gemm_experimental,
     launch_w8a16_gemm,
     quantize_activation_torch,
     quantize_activation_triton,
@@ -10,7 +9,6 @@ from nanovllm.quantization.kernels.fp8 import (
 
 __all__ = [
     "launch_scaled_mm_w8a8",
-    "launch_w8a8_fused_gemm_experimental",
     "launch_w8a16_gemm",
     "quantize_activation_torch",
     "quantize_activation_triton",

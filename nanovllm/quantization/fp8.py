@@ -7,10 +7,11 @@ from typing import Any
 import torch
 from torch import nn
 
+from nanovllm.quantization.cuda_ext import launch_w8a8_cutlass_gemm
+from nanovllm.quantization.w8a8_jit import launch_w8a8_cuda_ptx_jit
 from nanovllm.quantization.kernels import (
-    launch_scaled_mm_w8a8,
     launch_w8a16_gemm,
-    launch_w8a8_fused_gemm_experimental,
+    launch_scaled_mm_w8a8,
     to_scaled_mm_weight,
 )
 from nanovllm.quantization.base_config import QuantizationConfig, QuantizeMethodBase
@@ -18,21 +19,15 @@ from nanovllm.quantization.base_config import QuantizationConfig, QuantizeMethod
 
 _SUPPORTED_FP8_TYPES = {"fp8_w8a16", "fp8_w8a8_static"}
 _FP8_BACKEND_LOGGED: set[str] = set()
-_SUPPORTED_W8A8_ACT_QUANT_BACKENDS = {"torch", "triton"}
-_SUPPORTED_W8A8_RUNTIME_BACKENDS = {"scaled_mm", "fused_triton"}
-_SUPPORTED_W8A16_BACKENDS = {"auto", "dequant_matmul", "triton"}
-
-
-def get_w8a8_scaled_mm_min_dim() -> int:
-    return int(os.environ.get("NANOVLLM_FP8_W8A8_SCALED_MM_MIN_DIM", "3072"))
-
-
-def get_w8a8_scaled_mm_min_m() -> int:
-    return int(os.environ.get("NANOVLLM_FP8_W8A8_SCALED_MM_MIN_M", "1"))
+_SUPPORTED_W8A8_RUNTIME_BACKENDS = {"torch", "ptx", "cutlass", "auto"}
 
 
 def get_w8a8_runtime_backend() -> str:
-    backend = os.environ.get("NANOVLLM_FP8_W8A8_RUNTIME_BACKEND", "scaled_mm").strip().lower()
+    backend = os.environ.get("NANOVLLM_FP8_W8A8_RUNTIME_BACKEND", "auto").strip().lower()
+    if backend == "scaled_mm":
+        backend = "torch"
+    if backend == "cuda_ptx":
+        backend = "ptx"
     if backend not in _SUPPORTED_W8A8_RUNTIME_BACKENDS:
         raise ValueError(
             "NANOVLLM_FP8_W8A8_RUNTIME_BACKEND must be one of "
@@ -41,24 +36,8 @@ def get_w8a8_runtime_backend() -> str:
     return backend
 
 
-def get_w8a16_backend() -> str:
-    backend = os.environ.get("NANOVLLM_FP8_W8A16_BACKEND", "auto").strip().lower()
-    if backend not in _SUPPORTED_W8A16_BACKENDS:
-        raise ValueError(
-            "NANOVLLM_FP8_W8A16_BACKEND must be one of "
-            f"{sorted(_SUPPORTED_W8A16_BACKENDS)}, got {backend!r}"
-        )
-    return backend
-
-
-def get_w8a8_act_quant_backend() -> str:
-    backend = os.environ.get("NANOVLLM_FP8_W8A8_ACT_QUANT", "triton").strip().lower()
-    if backend not in _SUPPORTED_W8A8_ACT_QUANT_BACKENDS:
-        raise ValueError(
-            "NANOVLLM_FP8_W8A8_ACT_QUANT must be one of "
-            f"{sorted(_SUPPORTED_W8A8_ACT_QUANT_BACKENDS)}, got {backend!r}"
-        )
-    return backend
+def get_w8a8_auto_threshold() -> int:
+    return int(os.environ.get("NANOVLLM_FP8_W8A8_AUTO_THRESHOLD", "16"))
 
 
 def is_fp8_config(config: Any) -> bool:
@@ -118,49 +97,38 @@ class Fp8LinearMethod(QuantizeMethodBase):
         device_index = layer.qweight.device.index if layer.qweight.device.index is not None else 0
         capability = torch.cuda.get_device_capability(device_index)
         if self.quant_config.quantization_type == "fp8_w8a8_static":
-            if not hasattr(torch, "_scaled_mm"):
-                raise RuntimeError("fp8_w8a8_static requires torch._scaled_mm")
             qweight = layer.qweight.view(torch.float8_e4m3fn)
-            min_dim = get_w8a8_scaled_mm_min_dim()
-            if max(qweight.shape) >= min_dim:
-                weight_scale = layer.weight_scale.to(torch.float32)
-                tensor_scale = weight_scale.max().clamp(min=1e-12)
-                rescale = (weight_scale / tensor_scale).reshape(1, -1)
-                scaled_weight = (qweight.to(torch.float32) * rescale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            runtime_backend = get_w8a8_runtime_backend()
+            weight_scale = layer.weight_scale.to(torch.float32)
+            tensor_scale = weight_scale.max().clamp(min=1e-12)
+            rescale = (weight_scale / tensor_scale).reshape(1, -1)
+            scaled_weight = (qweight.to(torch.float32) * rescale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            if runtime_backend in {"ptx", "auto"}:
+                layer.register_buffer("qweight_ptx", scaled_weight.t().contiguous())
+            if runtime_backend in {"cutlass", "auto"}:
+                layer.register_buffer("qweight_cutlass", to_scaled_mm_weight(scaled_weight))
+            if runtime_backend == "torch":
                 layer.register_buffer("qweight_scaled_mm", to_scaled_mm_weight(scaled_weight))
-                layer.register_buffer("weight_scale_scaled_mm", tensor_scale.reshape(()).to(torch.float32))
-                layer._fp8_backend = "w8a8_scaled_mm"
-                layer._fp8_w8a8_act_quant_backend = get_w8a8_act_quant_backend()
-                layer._fp8_w8a8_runtime_backend = get_w8a8_runtime_backend()
-                layer._fp8_w8a8_scaled_mm_min_m = get_w8a8_scaled_mm_min_m()
-            else:
-                layer._fp8_backend = "w8a8_dequant_matmul"
-            log_key = (
-                f"{layer._fp8_backend}_"
-                f"{getattr(layer, '_fp8_w8a8_runtime_backend', '')}_"
-                f"{getattr(layer, '_fp8_w8a8_act_quant_backend', '')}_"
-                f"{getattr(layer, '_fp8_w8a8_scaled_mm_min_m', '')}"
-            )
+            layer.register_buffer("weight_scale_scaled_mm", tensor_scale.reshape(()).to(torch.float32))
+            layer._fp8_backend = f"w8a8_{runtime_backend}"
+            layer._fp8_w8a8_runtime_backend = runtime_backend
+            layer._fp8_w8a8_auto_threshold = get_w8a8_auto_threshold()
+            log_key = f"{layer._fp8_backend}_{getattr(layer, '_fp8_w8a8_runtime_backend', '')}"
             if log_key not in _FP8_BACKEND_LOGGED:
                 print(
                     "[nanovllm] FP8 W8A8 static using "
-                    f"{layer._fp8_backend} with scaled_mm_min_dim={min_dim}, "
-                    f"scaled_mm_min_m={getattr(layer, '_fp8_w8a8_scaled_mm_min_m', 'n/a')}, "
-                    f"runtime_backend={getattr(layer, '_fp8_w8a8_runtime_backend', 'n/a')}"
+                    f"{layer._fp8_backend}, runtime_backend={runtime_backend}, "
+                    f"auto_threshold={layer._fp8_w8a8_auto_threshold}"
                 )
                 _FP8_BACKEND_LOGGED.add(log_key)
             return
-        w8a16_backend = get_w8a16_backend()
-        if w8a16_backend == "triton" or (w8a16_backend == "auto" and capability >= (8, 9)):
-            layer._fp8_backend = "w8a16_triton"
-            if "triton" not in _FP8_BACKEND_LOGGED:
-                print("[nanovllm] FP8 W8A16 using Triton on-the-fly weight dequant kernel")
-                _FP8_BACKEND_LOGGED.add("triton")
-            return
-        layer._fp8_backend = "w8a16_dequant_matmul"
-        if "dequant_matmul" not in _FP8_BACKEND_LOGGED:
-            print("[nanovllm] FP8 W8A16 using per-forward BF16 dequant matmul")
-            _FP8_BACKEND_LOGGED.add("dequant_matmul")
+        if capability < (8, 9):
+            raise RuntimeError("FP8 W8A16 Triton runtime requires SM89 or newer")
+        layer._fp8_backend = "w8a16_triton"
+        if "w8a16_triton" not in _FP8_BACKEND_LOGGED:
+            print("[nanovllm] FP8 W8A16 using Triton on-the-fly kernel")
+            _FP8_BACKEND_LOGGED.add("w8a16_triton")
+        return
 
     def apply(self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         target_dtype = x.dtype
@@ -169,37 +137,59 @@ class Fp8LinearMethod(QuantizeMethodBase):
             x_2d = x_2d.to(torch.bfloat16)
         w_fp8 = layer.qweight.view(torch.float8_e4m3fn)
         backend = getattr(layer, "_fp8_backend", None)
-        if x.is_cuda and backend == "w8a8_scaled_mm":
-            if x_2d.shape[0] >= getattr(layer, "_fp8_w8a8_scaled_mm_min_m", 16):
-                runtime_backend = getattr(layer, "_fp8_w8a8_runtime_backend", "scaled_mm")
-                if runtime_backend == "fused_triton":
-                    out = launch_w8a8_fused_gemm_experimental(
-                        x_2d,
-                        layer.qweight_scaled_mm,
-                        layer.input_scale,
-                        layer.weight_scale_scaled_mm,
-                        bias,
-                    )
-                else:
-                    out = launch_scaled_mm_w8a8(
-                        x_2d,
-                        layer.qweight_scaled_mm,
-                        layer.input_scale,
-                        layer.weight_scale_scaled_mm,
-                        bias,
-                        getattr(layer, "_fp8_w8a8_act_quant_backend", "torch"),
-                    )
-                return out.view(*x.shape[:-1], -1).to(target_dtype)
-            backend = "w8a8_dequant_matmul"
+        if x.is_cuda and backend == "w8a8_ptx":
+            out = launch_w8a8_cuda_ptx_jit(
+                x_2d,
+                layer.qweight_ptx,
+                layer.input_scale,
+                layer.weight_scale_scaled_mm,
+                bias,
+            )
+            return out.view(*x.shape[:-1], -1).to(target_dtype)
+        if x.is_cuda and backend == "w8a8_cutlass":
+            out = launch_w8a8_cutlass_gemm(
+                x_2d,
+                layer.qweight_cutlass,
+                layer.input_scale,
+                layer.weight_scale_scaled_mm,
+                bias,
+            )
+            return out.view(*x.shape[:-1], -1).to(target_dtype)
+        if x.is_cuda and backend == "w8a8_auto":
+            if x_2d.shape[0] <= getattr(layer, "_fp8_w8a8_auto_threshold", 16):
+                out = launch_w8a8_cuda_ptx_jit(
+                    x_2d,
+                    layer.qweight_ptx,
+                    layer.input_scale,
+                    layer.weight_scale_scaled_mm,
+                    bias,
+                )
+            else:
+                out = launch_w8a8_cutlass_gemm(
+                    x_2d,
+                    layer.qweight_cutlass,
+                    layer.input_scale,
+                    layer.weight_scale_scaled_mm,
+                    bias,
+                )
+            return out.view(*x.shape[:-1], -1).to(target_dtype)
+        if x.is_cuda and backend == "w8a8_torch":
+            out = launch_scaled_mm_w8a8(
+                x_2d,
+                layer.qweight_scaled_mm,
+                layer.input_scale,
+                layer.weight_scale_scaled_mm,
+                bias,
+                act_quant_backend="torch",
+            )
+            return out.view(*x.shape[:-1], -1).to(target_dtype)
         if x.is_cuda and backend == "w8a16_triton":
             out = launch_w8a16_gemm(x_2d, w_fp8, layer.weight_scale, bias)
             return out.view(*x.shape[:-1], -1).to(target_dtype)
-        if backend in {"w8a16_dequant_matmul", "w8a8_dequant_matmul"} or not x.is_cuda:
-            w_bf16 = w_fp8.to(torch.bfloat16) * layer.weight_scale.to(torch.bfloat16).unsqueeze(0)
-            out = torch.mm(x_2d, w_bf16)
-            if bias is not None:
-                out = out + bias
-            return out.view(*x.shape[:-1], -1).to(target_dtype)
+        if self.quant_config.quantization_type == "fp8_w8a8_static":
+            raise RuntimeError("FP8 W8A8 static requires CUDA")
+        if self.quant_config.quantization_type == "fp8_w8a16":
+            raise RuntimeError("FP8 W8A16 requires CUDA with the Triton runtime")
         raise RuntimeError(f"FP8 backend is not initialized: {backend!r}")
 
     def _make_qweight_loader(self, layer: nn.Module):

@@ -8,7 +8,12 @@ import torch
 import torch.distributed as dist
 
 from nanovllm.config import Config
-from nanovllm.utils.kv_cache import kv_cache_bytes_per_element, kv_cache_scale_dtype_bytes_per_element, normalize_kv_cache_dtype
+from nanovllm.utils.kv_cache import (
+    k_int8_group_size_from_env,
+    k_int8_recent_bf16_window_from_env,
+    kv_cache_scale_dtype_bytes_per_element,
+    normalize_kv_cache_dtype,
+)
 from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.sampler import Sampler
 from nanovllm.models.models import model_dict
@@ -147,12 +152,25 @@ class ModelRunner:
         return get_kv_cache_profile()
 
     def warmup_model(self):
+        if os.environ.get("NANOVLLM_SKIP_MODEL_WARMUP", "0") == "1":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            return
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = (
             self.config.max_num_batched_tokens,
             self.config.max_model_len,
         )
+        warmup_tokens = int(os.environ.get("NANOVLLM_MODEL_WARMUP_TOKENS", "0"))
+        is_moe_model = (
+            hasattr(self.config.hf_config, "moe_intermediate_size")
+            or "moe" in str(getattr(self.config.hf_config, "model_type", "")).lower()
+        )
+        if warmup_tokens <= 0 and not self.enforce_eager and self.ep_size == 1 and is_moe_model:
+            warmup_tokens = min(max_num_batched_tokens, 64)
+        if warmup_tokens > 0:
+            max_num_batched_tokens = min(max_num_batched_tokens, warmup_tokens)
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(
             max_num_batched_tokens // seq_len, self.config.max_num_seqs
@@ -166,10 +184,9 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
+        torch.cuda.empty_cache()
         free, total = torch.cuda.mem_get_info()
         used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         
         tp_size = dist.get_world_size(self.tp_group) if hasattr(self, "tp_group") and self.tp_group is not None else 1
         num_kv_heads = hf_config.num_key_value_heads // tp_size
@@ -183,30 +200,39 @@ class ModelRunner:
         kv_cache_dtype_name = normalize_kv_cache_dtype(config.kv_cache_dtype)
         if kv_cache_dtype_name == "bf16":
             kv_data_bpe = 2 * hf_config.torch_dtype.itemsize
-            scale_count = 0
-        elif kv_cache_dtype_name == "fp8_e4m3":
-            kv_data_bpe = 2 * kv_cache_bytes_per_element(config.kv_cache_dtype)
-            scale_count = 2
-        elif kv_cache_dtype_name == "fp8_v_only":
-            kv_data_bpe = hf_config.torch_dtype.itemsize + kv_cache_bytes_per_element(config.kv_cache_dtype)
-            scale_bpe = kv_cache_scale_dtype_bytes_per_element(config.kv_cache_scale_dtype)
-            scale_block_bytes = (
-                hf_config.num_hidden_layers
-                * self.block_size
-                * num_kv_heads
-                * scale_bpe
-            )
         elif kv_cache_dtype_name == "k_int8_v_fp8":
             kv_data_bpe = 2
+            recent_k_window = k_int8_recent_bf16_window_from_env()
             scale_bpe = kv_cache_scale_dtype_bytes_per_element(config.kv_cache_scale_dtype)
-            k_group_size = 32
+            k_group_size = k_int8_group_size_from_env(head_dim)
+            k_groups = head_dim // k_group_size
             scale_block_bytes = (
                 hf_config.num_hidden_layers
                 * self.block_size
                 * num_kv_heads
-                * (head_dim // k_group_size + 1)
+                * (k_groups + 1)
                 * scale_bpe
             )
+            shadow_k_block_bytes = (
+                hf_config.num_hidden_layers
+                * self.block_size
+                * num_kv_heads
+                * head_dim
+                * hf_config.torch_dtype.itemsize
+                if recent_k_window > 0
+                else 0
+            )
+        elif kv_cache_dtype_name == "fp8":
+            kv_data_bpe = 2
+            scale_bpe = kv_cache_scale_dtype_bytes_per_element(config.kv_cache_scale_dtype)
+            scale_block_bytes = (
+                hf_config.num_hidden_layers
+                * self.block_size
+                * num_kv_heads
+                * 2
+                * scale_bpe
+            )
+            shadow_k_block_bytes = 0
         else:
             raise AssertionError(f"Unhandled kv_cache_dtype={config.kv_cache_dtype!r}")
         kv_data_block_bytes = (
@@ -216,22 +242,26 @@ class ModelRunner:
             * head_dim
             * kv_data_bpe
         )
-        if kv_cache_dtype_name in {"bf16", "fp8_e4m3"}:
+        if kv_cache_dtype_name == "bf16":
             scale_block_bytes = 0
-            scale_count = 2 if kv_cache_dtype_name == "fp8_e4m3" else 0
-            scale_block_bytes = (
-                scale_count
-                * hf_config.num_hidden_layers
-                * self.block_size
-                * num_kv_heads
-                * kv_cache_scale_dtype_bytes_per_element(config.kv_cache_scale_dtype)
+            shadow_k_block_bytes = 0
+        block_bytes = kv_data_block_bytes + scale_block_bytes + shadow_k_block_bytes
+        requested_num_blocks = int(config.num_kvcache_blocks)
+        workspace_reserve_bytes = 1024 * 1024 * 1024
+        budget_bytes = int(free * config.gpu_memory_utilization) - workspace_reserve_bytes
+        if requested_num_blocks > 0:
+            config.num_kvcache_blocks = requested_num_blocks
+        else:
+            config.num_kvcache_blocks = budget_bytes // block_bytes
+        if config.num_kvcache_blocks <= 0:
+            raise RuntimeError(
+                "KV cache block budget is non-positive: "
+                f"num_kvcache_blocks={config.num_kvcache_blocks}, "
+                f"budget_bytes={budget_bytes}, block_bytes={block_bytes}, "
+                f"free_bytes={free}, used_bytes={used}, total_bytes={total}, "
+                f"gpu_memory_utilization={config.gpu_memory_utilization}, "
+                f"workspace_reserve_bytes={workspace_reserve_bytes}."
             )
-        block_bytes = kv_data_block_bytes + scale_block_bytes
-        config.num_kvcache_blocks = (
-            int(total * config.gpu_memory_utilization - used - peak + current)
-            // block_bytes
-        )
-        assert config.num_kvcache_blocks > 0
         cache_shape = (
             hf_config.num_hidden_layers,
             config.num_kvcache_blocks,
@@ -240,40 +270,49 @@ class ModelRunner:
             head_dim,
         )
         scale_cache_shape = (hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads)
-        if kv_cache_dtype_name == "fp8_v_only":
-            self.k_cache_storage = torch.zeros(cache_shape, dtype=hf_config.torch_dtype, device="cuda")
-            self.v_cache_storage = torch.empty(cache_shape, dtype=torch.float8_e4m3fn, device="cuda")
-            self.kv_cache = torch.tensor([], device="cuda")
-            self.k_scale_cache = torch.tensor([], device="cuda")
-            scale_dtype = getattr(torch, config.kv_cache_scale_dtype)
-            self.v_scale_cache = torch.empty(scale_cache_shape, dtype=scale_dtype, device="cuda")
-        elif kv_cache_dtype_name == "k_int8_v_fp8":
+        if kv_cache_dtype_name == "k_int8_v_fp8":
+            recent_k_window = k_int8_recent_bf16_window_from_env()
             self.k_cache_storage = torch.empty(cache_shape, dtype=torch.int8, device="cuda")
             self.v_cache_storage = torch.empty(cache_shape, dtype=torch.float8_e4m3fn, device="cuda")
             self.kv_cache = torch.tensor([], device="cuda")
+            self.k_bf16_shadow_cache = (
+                torch.empty(cache_shape, dtype=hf_config.torch_dtype, device="cuda")
+                if recent_k_window > 0
+                else torch.tensor([], device="cuda")
+            )
             scale_dtype = getattr(torch, config.kv_cache_scale_dtype)
-            k_group_size = 32
+            k_group_size = k_int8_group_size_from_env(head_dim)
             self.k_scale_cache = torch.empty(
                 (*scale_cache_shape, head_dim // k_group_size), dtype=scale_dtype, device="cuda"
             )
             self.v_scale_cache = torch.empty(scale_cache_shape, dtype=scale_dtype, device="cuda")
+        elif kv_cache_dtype_name == "fp8":
+            self.k_cache_storage = torch.empty(cache_shape, dtype=torch.float8_e4m3fn, device="cuda")
+            self.v_cache_storage = torch.empty(cache_shape, dtype=torch.float8_e4m3fn, device="cuda")
+            self.kv_cache = torch.tensor([], device="cuda")
+            self.k_bf16_shadow_cache = torch.tensor([], device="cuda")
+            scale_dtype = getattr(torch, config.kv_cache_scale_dtype)
+            self.k_scale_cache = torch.empty(scale_cache_shape, dtype=scale_dtype, device="cuda")
+            self.v_scale_cache = torch.empty(scale_cache_shape, dtype=scale_dtype, device="cuda")
         else:
-            kv_cache_dtype = torch.float8_e4m3fn if kv_cache_dtype_name == "fp8_e4m3" else hf_config.torch_dtype
+            kv_cache_dtype = hf_config.torch_dtype
             kv_cache_shape = (2, *cache_shape)
-            self.kv_cache = torch.empty(kv_cache_shape, dtype=kv_cache_dtype, device="cuda") if kv_cache_dtype == torch.float8_e4m3fn else torch.zeros(kv_cache_shape, dtype=kv_cache_dtype, device="cuda")
+            self.kv_cache = torch.zeros(kv_cache_shape, dtype=kv_cache_dtype, device="cuda")
             self.k_cache_storage = self.kv_cache[0]
             self.v_cache_storage = self.kv_cache[1]
-            if kv_cache_dtype == torch.float8_e4m3fn:
-                scale_dtype = getattr(torch, config.kv_cache_scale_dtype)
-                self.k_scale_cache = torch.empty(scale_cache_shape, dtype=scale_dtype, device="cuda")
-                self.v_scale_cache = torch.empty(scale_cache_shape, dtype=scale_dtype, device="cuda")
-            else:
-                self.k_scale_cache = self.v_scale_cache = torch.tensor([], device="cuda")
+            self.k_bf16_shadow_cache = torch.tensor([], device="cuda")
+            self.k_scale_cache = self.v_scale_cache = torch.tensor([], device="cuda")
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.k_cache_storage[layer_id]
                 module.v_cache = self.v_cache_storage[layer_id]
+                if hasattr(module, "k_bf16_shadow_cache"):
+                    module.k_bf16_shadow_cache = (
+                        self.k_bf16_shadow_cache[layer_id]
+                        if self.k_bf16_shadow_cache.numel()
+                        else self.k_bf16_shadow_cache
+                    )
                 if self.k_scale_cache.numel() and hasattr(module, "k_scale_cache"):
                     module.k_scale_cache = self.k_scale_cache[layer_id]
                 if self.v_scale_cache.numel() and hasattr(module, "v_scale_cache"):
@@ -469,9 +508,23 @@ class ModelRunner:
                 context_lens=context_lens[:bs],
                 block_tables=block_tables[:bs],
             )
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # capture
+            old_moe_graph_align = os.environ.get("NANOVLLM_MOE_GRAPH_ALIGN")
+            os.environ["NANOVLLM_MOE_GRAPH_ALIGN"] = "1"
+            try:
+                # Two warmup passes BEFORE capture: the first triggers Triton
+                # JIT / autotune for this bs, the second confirms the autotune
+                # cache hit so capture sees no host-side compile work. The
+                # explicit synchronize drains any deferred host kernels.
+                for _ in range(2):
+                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+                torch.cuda.synchronize()
+                with torch.cuda.graph(graph, self.graph_pool):
+                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # capture
+            finally:
+                if old_moe_graph_align is None:
+                    os.environ.pop("NANOVLLM_MOE_GRAPH_ALIGN", None)
+                else:
+                    os.environ["NANOVLLM_MOE_GRAPH_ALIGN"] = old_moe_graph_align
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph

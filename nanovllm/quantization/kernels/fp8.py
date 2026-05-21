@@ -109,6 +109,118 @@ def launch_w8a16_gemm(
     return out
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 256}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 256}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 256}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 256}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128}, num_stages=3, num_warps=8),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def w8a16_downproj_gemm_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    w_scale_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    w_scale = tl.load(w_scale_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for kk in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_offsets = kk * BLOCK_SIZE_K + offs_k
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (k_offsets[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(k_offsets[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(
+            a.to(tl.float32).to(tl.float16),
+            b.to(tl.float32).to(tl.float16),
+            out_dtype=tl.float32,
+        )
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    c = acc * w_scale[None, :]
+    if bias_ptr is not None:
+        c += tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)[None, :]
+    tl.store(
+        c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :],
+        c,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def launch_w8a16_downproj_gemm(
+    x_bf16: torch.Tensor,
+    w_fp8: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    assert x_bf16.is_cuda and w_fp8.is_cuda
+    M, K = x_bf16.shape
+    N = w_fp8.shape[1]
+    out = torch.empty((M, N), device=x_bf16.device, dtype=torch.bfloat16)
+    grid = lambda meta: (
+        triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]),
+    )
+    w8a16_downproj_gemm_kernel[grid](
+        x_bf16,
+        w_fp8,
+        out,
+        weight_scale,
+        bias,
+        M,
+        N,
+        K,
+        x_bf16.stride(0),
+        x_bf16.stride(1),
+        w_fp8.stride(0),
+        w_fp8.stride(1),
+        out.stride(0),
+        out.stride(1),
+        GROUP_SIZE_M=8,
+    )
+    return out
+
+
 def to_scaled_mm_weight(w_fp8: torch.Tensor) -> torch.Tensor:
     assert w_fp8.is_cuda
     k, n = w_fp8.shape

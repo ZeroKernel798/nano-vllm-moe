@@ -272,7 +272,7 @@ def write_csv(path: str, results: list[dict]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare MoE expert backends under the same EP setup")
     parser.add_argument("--model-path", type=str, default="/home/ubuntu/project/models/qwen/Qwen1.5-MoE-A2.7B-Chat")
-    parser.add_argument("--backends", type=str, default="eager,optimized,fused")
+    parser.add_argument("--backends", type=str, default="eager,optimized")
     parser.add_argument("--ep-backends", type=str, default="torch")
     parser.add_argument("--output-file", type=str, default="moe_backend_benchmark_summary.txt")
     parser.add_argument("--output-json", type=str, default="")

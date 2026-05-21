@@ -1,166 +1,237 @@
 # Nano-vLLM-MoE
 
-Nano-vLLM-MoE 是一个轻量 vLLM-style 推理实验项目。当前只保留三条主线：
+本项目基于 Nano-vLLM，专注在单卡（RTX 4090 24GB 级别）环境下验证三条推理优化路线：FP8 权重/激活量化、KV cache 压缩与前缀复用、MoE 调度与 CUDA Graph。代码刻意保持小而可读，每条优化都配 microbench 和质量 gate，结论可以追溯到具体远端日志。原项目地址：https://github.com/GeeeekExplorer/nano-vllm.git
 
-1. **MoE runtime**：模块化 router、prepare/finalize 和 expert backend，用于本地与基础 EP 实验。
-2. **Chunked prefill**：scheduler 和 sequence 支持 partial prefill，并保留 `prefill_first` / `decode_first` 两种策略。
-3. **量化重构**：当前按 RTX 4090 / 7B 主线推进：BF16 baseline -> W8A16 -> FP8 KV cache -> W8A8。
+## 主要特点
 
-EP 只保留基础 `torch` all-to-all 路径，不再携带早期实验原型。历史 README 仅保留在 `docs/README_legacy.md`，其它旧实验文档和过期 benchmark 计划已清理。
+* FP8 W8A16 量化 — 基于 Triton 的 on-the-fly dequant GEMM，权重体积 `-44.8%`，decode TPS `1.21x`
+* FP8 W8A8 静态量化 — Torch `_scaled_mm` / 自定义 PTX / in-repo CUTLASS 三后端，checkpoint `-42.8%`，WikiText PPL 漂移仅 `+0.0267`
+* K-int8 / V-FP8 混合 KV — 长上下文显存压力路径，bytes/block 约 BF16 的 `0.52x`，teacher-forced PPL 全长度 `< +1.55%`
+* 模块化 MoE Runtime — `router → prepare/finalize → expert → finalize` 四段拆分，`eager` 与 `optimized` 双后端可切换
+* MoE CUDA Graph — 单卡 (`ep_size=1`) 默认开启，decode `4.55x` vs eager 后端，`128/128` greedy-token 一致
+* Hash + Radix Prefix Cache — block-level metadata 双后端，shared-prefix 命中率 `87.5%`
+* Chunked Prefill — `decode_first` 调度策略，32K 长 prefill 干扰下短 decode 卡顿从 `4197 ms` 压到 `57 ms`
+* Quantization Suite — 完整 PPL / MMLU logit-rank / linear backend microbench 质量门
 
-## 当前范围
-
-| 方向 | 状态 | 主要文件 |
-| --- | --- | --- |
-| MoE runtime | 阶段性稳定 | `nanovllm/executor/moe/`, `scripts/moe/` |
-| Chunked prefill | 当前保留功能 | `nanovllm/engine/scheduler.py`, `nanovllm/engine/sequence.py`, `scripts/generation/chunked_prefill_bench.py` |
-| Quantization | 当前重构主线 | `nanovllm/quantization/`, `scripts/quantization/`, `scripts/kv_cache/` |
-| EP | 只保留基础语义路径 | `nanovllm/executor/moe/prepare_finalize/torch_alltoall.py` |
-
-## MoE Runtime
-
-当前 MoE 路径：
-
-```text
-router -> prepare/finalize -> expert backend -> finalize output
-```
-
-Expert backends：
-
-| Backend | 角色 | 文件 |
-| --- | --- | --- |
-| `eager` | correctness/reference | `nanovllm/executor/moe/experts/eager_experts.py` |
-| `optimized` | 当前实际优化路径 | `nanovllm/executor/moe/experts/optimized.py` |
-| `fused` | Triton grouped-GEMM 实验路径 | `nanovllm/executor/moe/experts/fused.py` |
-
-EP 暂不作为性能收益声明，只保留 `torch` all-to-all baseline，保证分布式 MoE 语义可测。
-
-## Chunked Prefill
-
-Chunked prefill 是 scheduler-level 功能，用于把长 prefill 请求拆成多个小块调度。
-
-| Policy | 行为 | 用途 |
-| --- | --- | --- |
-| `prefill_first` | 优先继续 prefill chunk | 简单 correctness/default 行为 |
-| `decode_first` | prefill chunk 之间优先 decode | latency-control 实验 |
-
-运行：
+## 安装
 
 ```bash
-python scripts/generation/chunked_prefill_bench.py \
-  --model-path /path/to/model \
-  --max-model-len 0 \
-  --phases 1,2,3
+git clone https://github.com/ZeroKernel798/nano-vllm-moe.git
+cd nano-vllm-moe
+pip install -e .
 ```
-
-## RTX 4090 7B 量化栈
-
-量化重构按 7B 优先推进。小模型仍可做 smoke，但 README 和主线结论以 Qwen2.5-7B on RTX 4090 为准。
-
-| 阶段 | Mode | 目标 |
-| --- | --- | --- |
-| 0 | BF16 | 质量、延迟、显存 baseline |
-| 1 | W8A16 | 稳定 weight-only FP8 checkpoint/runtime |
-| 2 | W8A16 + FP8 KV | 长上下文显存压力和 KV 精度 |
-| 3 | W8A8 | W8A16/KV 稳定后再做 aggressive activation quant |
-
-### 最新 7B Baseline
-
-测试设置：2026-05-13，1x RTX 4090 24GB，Qwen2.5-7B-Instruct，固定 synthetic prompt `input=512, output=64`，`max_model_len=2048`，`gpu_memory_utilization=0.9`，一次 warmup、一次计时。远端证据根目录：`.remote-logs/quantization/4090_7b_stack_20260513/`。
-
-| Mode | Checkpoint size | PPL proxy | Bench prefill TPS | Bench decode TPS | Memory-run prefill TPS | Memory-run decode TPS | Peak reserved |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| BF16 | 15.24 GB | 7.4367 | 10634.5 | 62.50 | 489.6 | 61.81 | 19.98 GB |
-| W8A16 | 8.72 GB | 7.4772 | 5258.7 | 15.22 | 668.7 | 15.26 | 20.92 GB |
-
-W8A16 checkpoint contract 健康（`196` 个 qweight tensor 和 `196` 个 weight-scale tensor）。最初的 SM89 Triton 路径会失败，是因为 direct FP8-to-BF16 conversion 生成了 SM90-only 指令；当前 W8A16 Triton kernel 已改为在 GEMM loop 内做 FP8->FP32->FP16 on-the-fly dequantization，不使用 load-time 解压权重 cache。2026-05-15 的 3B 512/16 smoke 从 per-forward dequant `1.1368 s` 改善到 SM89-safe Triton `0.8247 s`，decode TPS 从 `37.76` 提升到 `143.90`；7B 512/16 Triton smoke 也能编译运行（`0.9960 s`，decode TPS `71.79`）。当前 prefill 仍弱，下一步继续优化 tile 和转换开销。
-
-### 最新 7B FP8 KV Probe
-
-同一个 7B W8A16 checkpoint，`output=16`，native FP8 paged decode；脚本内同时跑 BF16 KV reference 和 FP8 KV。
-
-| Prompt | KV mode | KV storage | Prefill TPS | Decode TPS | Wall time | Peak reserved | Token match |
-| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 8192 | BF16 KV | 11.09 GB | 4224.7 | 8.48 | 3.71 s | 21.16 GB | reference |
-| 8192 | FP8 KV | 2.90 GB | 7811.0 | 8.63 | 2.79 s | 21.17 GB | 1/16 |
-| 16384 | BF16 KV | 10.01 GB | 5673.4 | 9.27 | 4.51 s | 21.31 GB | reference |
-| 16384 | FP8 KV | 1.81 GB | 9623.6 | 10.35 | 3.15 s | 21.31 GB | 2/16 |
-
-FP8 KV 显著降低 KV storage，但 token match 还不合格。下一步先做 logits divergence debug，不能直接把 FP8 KV 作为默认路径。
-
-2026-05-14 backend isolation 更新：7B W8A16 在 `input=512, output=8` 下，`gather_dequant` 和 `full_dequant` 完全一致，但二者相对 BF16 的生成 token match 仍只有 `0.25`；KV scale cache 从 float16 改成 float32 也不能修复。因此下一步应重点查 FP8 KV storage quantization 本身，而不是只查 native paged attention kernel。
-
-2026-05-14 K/V sensitivity 更新：7B 发散来自 K cache FP8 量化。新增实验性 K-BF16/V-FP8 模式，在 512-token 和 8K-token prompt 上都保持 exact token match，同时 KV bytes/block 降到 BF16 的 `75.39%`，因此当前安全方向是 V-only FP8。
-
-K quantization probe：FP8 K 仍不稳定；fake symmetric int8 K 在 vector 或 16/32/64 group 下都能在 7B 512-token probe 上保持 exact tokens。下一步压缩方向应是 K-int8/V-FP8，而不是 K-FP8/V-FP8。
-
-K-int8/V-FP8 mixed KV 已在 7B W8A16 的 512/8K/16K token-match gate 上通过，per-block KV bytes 降到 BF16 的 `51.95%`（含 scale）。当前优化路径使用 Triton fused mixed-KV store 和 native mixed paged decode；512 短上下文 decode 仍慢于 BF16，但长上下文 decode 已有明确收益。
-
-| Prompt | Backend | Exact tokens | Logits cosine | Model TPS | 相对 BF16 加速 | KV bytes/block vs BF16 | KV blocks vs BF16 |
-| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 8192 | BF16 KV | reference | reference | 4.34 | 1.00x | 1.0000 | 1.00x |
-| 8192 | K-int8/V-FP8 native | yes | 0.99989 | 14.64 | 3.37x | 0.5195 | 1.56x |
-| 16384 | BF16 KV | reference | reference | 4.11 | 1.00x | 1.0000 | 1.00x |
-| 16384 | K-int8/V-FP8 native | yes | 0.99987 | 10.77 | 2.62x | 0.5195 | 1.57x |
-| 32512 | BF16 KV | reference | reference | 4.03 | 1.00x | 1.0000 | 1.00x |
-| 32512 | K-int8/V-FP8 native | yes | 0.99986 | 6.43 | 1.59x | 0.5195 | 1.53x |
-
-### 最新 7B W8A8 质量 Probe
-
-W8A8 已按 profile-driven 的 shape-aware backend 重启，而不是全层无脑启用。3B W8A8 static 在 `M=512` 下显示，大 MLP projection 适合 `_scaled_mm`，但 2K attention projection 会被 activation quant 开销拖慢，因此默认回退到 FP8 weight dequant matmul。runtime cutoff 由 `NANOVLLM_FP8_W8A8_SCALED_MM_MIN_DIM` 控制，默认 `3072`；W8A8 activation quant 默认使用 Triton 路径。
-
-| Gate | BF16 | W8A8 shape-aware | 结论 |
-| --- | ---: | ---: | --- |
-| MMLU logit-rank，300 题 | `0.6033` | `0.6200` | 无 accuracy regression；prediction agreement `0.9567` |
-| WikiText-2 validation PPL，1024 tokens | `8.3971` | `8.4238` | 绝对漂移仅 `+0.0267` |
-| GSM8K numeric，50 题 | `0.32` | `0.36` | 无 accuracy regression，但生成一致率低 |
-| 7B model size | `15.24 GB` | `8.72 GB` | checkpoint 小 `42.8%` |
-
-3B smoke 已通过：shape-aware prefill TPS `10047.6`，高于 all-scaled-mm `9277.6`；BF16-vs-W8A8 correctness probe 的 avg logits cosine 为 `0.998857`，三个 prompt 的生成 token 全部 exact match。同一 cutoff 已在 7B 上启动：checkpoint contract 健康（`196` 个 qweight/weight-scale/input-scale tensor），shape profile 中 `gate/up/down` 的 W8A8-vs-BF16 分别约 `0.49x/0.49x/0.78x`，attention projection 约 `0.87x-0.88x`，512/16 smoke 的 prefill TPS 为 `8775.6`、decode TPS 为 `61.48`、model size 为 `8.72 GB`。2026-05-15 的 W8A8 fallback-layer dequant cache 在 3B 512/16 上把 wall time 从 `0.2350 s` 降到 `0.2062 s`，但在 7B memory gate 通过前仍保持 opt-in。在 W8A8 calibration 同源的 WikiText-2 validation 上，7B HF proxy PPL 为 `8.4238`，BF16 为 `8.3971`，评估长度 1024 tokens。memory-safe MMLU logit-rank gate 跑 300 题：BF16 accuracy `0.6033`、W8A8 accuracy `0.6200`、prediction agreement `0.9567`；GSM8K 50 题 greedy numeric probe 中 BF16 `0.32`、W8A8 `0.36`，但 same-number agreement 只有 `0.28`，因此 GSM8K 更适合作为 generation-sensitivity 补充探针，而不是主 quantization gate。
-
-## 仓库结构
-
-| Path | 用途 |
-| --- | --- |
-| `nanovllm/engine/` | scheduler、sequence、model runner、block manager |
-| `nanovllm/executor/moe/` | 模块化 MoE runtime |
-| `nanovllm/quantization/` | quantization method registry 和 FP8 runtime |
-| `scripts/moe/` | MoE local compute、backend、基础 EP 脚本 |
-| `scripts/generation/` | generation 和 chunked prefill benchmark |
-| `scripts/quantization/` | FP8 export/eval/runtime benchmark suite |
-| `scripts/kv_cache/` | FP8 KV 验证和 microbench |
-| `opt/` | 仅保留当前重构记录 |
-| `docs/README_legacy.md` | legacy README 归档 |
 
 ## Quick Start
 
 ```bash
-pip install -e .
+python scripts/moe/moe_local_compute_bench.py --device cuda --backends eager,optimized
+python scripts/prefix_cache/prefix_cache_bench.py --model /path/to/model --scenario shared-prefix
+python scripts/generation/chunked_prefill_bench.py --model-path /path/to/model --phases 1,3
 ```
 
-运行 MoE local compute：
+## Benchmark
 
-```bash
-python scripts/moe/moe_local_compute_bench.py --device cuda --backends eager,optimized,fused
-```
+### FP8 W8A16 权重量化
 
-运行 chunked prefill：
+**测试配置**
 
-```bash
-python scripts/generation/chunked_prefill_bench.py --model-path /path/to/model --max-model-len 0
-```
+- Hardware: NVIDIA GeForce RTX 4090 24GB
+- Model: Qwen2.5-7B-Instruct（BF16 基线 / W8A16 静态导出）
+- Parallelism: TP=1, EP=1
+- 量化导出: `scripts/quantization/quantize.py --scheme fp8_w8a16`，量化 `252/434` 个 tensor
+- Decode 场景: 输入 512，输出 128 / 16，warmup 1，repeat 3
 
-运行 7B 量化栈：
+**测试结果**
 
-```bash
-python scripts/quantization/run_4090_7b_stack.py \
-  --bf16-model-path /path/to/Qwen2.5-7B-Instruct \
-  --w8a16-model-path /path/to/Qwen2.5-7B-Instruct-FP8-W8A16 \
-  --stages bf16,w8a16,kv
-```
+| 方案 | Model size bytes | Decode TPS (out=16) | Decode TPS (out=128) | 相对 BF16 |
+|------|------:|------:|------:|------:|
+| BF16 基线 | `6,183,464,346` | `130.69 tok/s` | — | `1.00x` |
+| FP8 W8A16 | `3,413,055,132` | `158.36 tok/s` | `158.73 tok/s` | `1.21x` |
 
-## 下一步
+**分析要点**：W8A16 是最简单的权重量化路径，权重体积从 `6.18 GB` 降到 `3.41 GB`（`-44.8%`）；Triton 的 on-the-fly dequant 在 decode 阶段把权重带宽压力换成计算，512 prompt 上 decode `1.21x`。CUDA reserved/allocated 端到端差异小于 checkpoint 差异，所以只把它定位为 "weight-only 省占用 + decode 改善"，不延伸到整卡显存减半。
 
-1. 扩大 native K-int8/V-FP8 到 16K/32K 和更多 seeds，并增加短上下文 backend cutoff。
-2. 优化或替换当前 SM89 W8A16 dequant-matmul runtime。
-3. 扩大 MMLU/CEval 覆盖后再最终推广 W8A8。
+---
+
+### FP8 W8A8 静态量化
+
+**测试配置**
+
+- Hardware: NVIDIA GeForce RTX 4090 24GB
+- Model: Qwen2.5 系列（BF16 基线 / W8A8 静态导出，激活 scale 离线校准）
+- Parallelism: TP=1, EP=1
+- 量化导出: `scripts/quantization/quantize.py --scheme fp8_w8a8_static`
+- Linear backend: Torch `_scaled_mm` / 自定义 PTX / in-repo CUTLASS（自定义 epilogue）
+- 质量评测: WikiText-2 PPL（1024 tokens）+ MMLU 120 题 logit-rank
+- E2E throughput 跑在 3B-scale config（`hidden_size=2048`, `intermediate_size=11008`, `36` layers），真 7B microbench 单独提供
+
+**质量 gate（7B）**
+
+| Gate | BF16 | W8A8 | Delta |
+|------|------:|------:|------:|
+| Checkpoint size | `15.24 GB` | `8.72 GB` | `-42.8%` |
+| WikiText-2 PPL, 1024 tokens | `8.3971` | `8.4238` | `+0.0267` |
+| MMLU logit-rank, 120 题 | `80.00%` | `79.17%` | `-0.83 pp` |
+| MMLU prediction agreement | reference | `96.67%` | `4 / 120` flips |
+
+**Linear backend microbench（3B-scale）**
+
+| Layer | Shape `(M,K,N)` | BF16 | Torch | PTX | CUTLASS | Winner |
+|------|---|------:|------:|------:|------:|------|
+| `self_attn.q_proj` | `1,2048,2048` | `0.0095 ms` | `0.0495 ms` | `0.0284 ms` | `0.0121 ms` | CUTLASS |
+| `mlp.up_proj` | `16,2048,11008` | `0.0301 ms` | `0.0486 ms` | `0.0304 ms` | `0.0112 ms` | CUTLASS |
+| `mlp.down_proj` | `256,11008,2048` | `0.0927 ms` | `0.0793 ms` | `0.1983 ms` | `0.0834 ms` | Torch |
+| `mlp.up_proj` | `1024,2048,11008` | `0.3252 ms` | `0.1864 ms` | `0.7310 ms` | `0.1853 ms` | CUTLASS |
+
+**3B-scale E2E throughput（同 W8A8 CUTLASS vs native BF16，普通 serving 路径）**
+
+| 阶段 | Input | Output | BF16 total tok/s | W8A8 total tok/s | W8A8/BF16 |
+|------|------:|------:|------:|------:|------:|
+| mixed | 1024 | 128 | `1154.21` | `1785.43` | `1.55x` |
+| mixed | 4096 | 128 | `3674.52` | `5608.63` | `1.53x` |
+| mixed | 16384 | 128 | `8541.24` | `11494.63` | `1.35x` |
+| mixed | 32640 | 128 | `9776.19` | `11788.54` | `1.21x` |
+
+**分析要点**：W8A8 在显著缩小 checkpoint 的同时保持质量门通过——PPL 漂移仅 `+0.0267`，MMLU 仅降 `0.83 pp`。Linear backend 测试显示 CUTLASS 在测试覆盖的 M 上整体更稳，原先 `M<=16` 自动走 PTX 的策略已暂停校准；Torch `_scaled_mm` 仍是必须保留的中等 M 参考。3B-scale 上 W8A8 CUTLASS 在 1K..16K 普通 serving 场景中 total throughput 提升 `1.35x..1.55x`。
+
+> **当前边界**：W8A8 端到端 Triton 在 SM89 仍触发 compiler abort；fused Triton W8A8 路径暂未启用。真 7B BF16 与配对 W8A8 export 已完成但 E2E 仍待补齐。
+
+---
+
+### K-int8 / V-FP8 混合 KV Cache
+
+**测试配置**
+
+- Hardware: NVIDIA GeForce RTX 4090 24GB
+- Model: Qwen2.5-7B-Instruct BF16
+- 量化口径: K int8 + V FP8，K group=32，scale dtype float16
+- 质量 gate: WikiText teacher-forced PPL/NLL（不再以 token exact alignment 为主 gate）
+- 显存测试: 固定 512 KV blocks 同容量对照 + 8K/64 generation peak
+
+**Teacher-forced PPL（K group=32）**
+
+| Context | BF16 PPL | Mixed KV PPL | Delta | bytes/block |
+|------:|------:|------:|------:|------:|
+| 4K | reference | — | `+1.20%` | — |
+| 8K | reference | — | `+1.20%` | — |
+| 16K | reference | — | `+1.55%` | — |
+| 32K | reference | — | `-0.16%` | `0.5195x` BF16 |
+
+**显存收益（7B，固定 512 KV blocks）**
+
+| 指标 | BF16 KV | Mixed KV | Delta |
+|------|------:|------:|------:|
+| KV arena | `7.00 GiB` | `3.64 GiB` | `-3.36 GiB` |
+| 8K/64 generation peak allocated | `22.41 GiB` | `19.04 GiB` | `-3.37 GiB` |
+
+**分析要点**：K-int8/V-FP8 在 PPL 主 gate 上全长度通过（最差 `+1.55%`，32K 甚至略低于 BF16），同时 bytes/block 减半。同容量 KV blocks 下 KV arena 从 `7.00 GiB` 降到 `3.64 GiB`。Full FP8 KV（K 也用 FP8）在 4K/8K PPL smoke 上发散到 `1509.77`，所以主线只保留 K-int8/V-FP8 混合路径。Token exact alignment 在多 seed 检查中暴露 K group-size 敏感（32K seed1 只在 group-1 exact），因此 BF16 KV 仍是质量 reference。
+
+---
+
+### MoE Runtime（router → prepare/finalize → expert → finalize）
+
+**测试配置**
+
+- Hardware: NVIDIA GeForce RTX 4080 SUPER 16GB，driver `580.142`，Python 3.12.3
+- Model: Qwen1.5-MoE-A2.7B-Chat
+- Parallelism: TP=1, EP=1
+- Workload: 8 固定 prompts，input 16 / output 16，max model length 128，repeat 3
+
+**Local Compute（synthetic，8 expert / top-1 / 256 tokens）**
+
+| 后端 | Mean latency | Tokens/s | Correctness vs eager |
+|------|------:|------:|------|
+| `eager` | `1.974 ms` | `129.7K` | reference |
+| `optimized` | `0.945 ms` | `270.8K` | cosine `0.9999999` |
+
+**End-to-end 三模式对比**
+
+| 模式 | Wall mean | Prefill TPS | Decode TPS | Decode 加速 | Greedy match |
+|------|------:|------:|------:|------:|------|
+| `eager` 后端（Python per-token expert loop） | `3.268 s` | `376.14` | `40.98` | `1.00x` | reference |
+| `optimized` 后端，`--enforce-eager`（Triton fused MoE） | `1.142 s` | `1213.93` | `115.81` | `2.83x` | exact |
+| `optimized` 后端，CUDA Graph | `0.747 s` | `1242.94` | `186.45` | `4.55x` | `128/128` tokens |
+
+**分析要点**：`optimized` 后端通过 Triton fused MoE kernel 把 expert 计算从 Python per-token 循环搬到 GPU，已经带来 `2.83x` 的 decode 提升。在此之上启用 CUDA Graph 又叠加 `1.61x`，把 `torch.bincount` 的 host-sync、side-stream overlap、动态 workspace 分配等 capture 不安全的点逐个修掉之后，单卡 `ep_size=1` 上可以稳定 capture/replay 并且与 eager 输出完全一致（`128/128`）。
+
+> **当前边界**：EP all-to-all 因动态 collective 仍强制 eager；fused 后端已移除，`optimized` 是唯一非 eager 后端。
+
+---
+
+### Prefix Cache（hash + radix）
+
+**测试配置**
+
+- Hardware: NVIDIA GeForce RTX 4090 24GB
+- Model: Qwen2.5-3B-Instruct
+- Workload: 8 请求，shared prefix `1024` tokens，unique `128` tokens，output `8`，block size `256`
+- Backend: `hash`（默认）/ `radix`（block-level radix metadata）
+
+**测试结果**
+
+| Backend | Scenario | Token Hit Rate | Total Time | Prefill TPS | Decode TPS |
+|---------|----------|------:|------:|------:|------:|
+| hash | no-reuse | `0.0%` | `2.367 s` | `4288.8` | `259.0` |
+| hash | shared-prefix | `87.5%` | `1.540 s` | `1551.4` | `257.1` |
+| hash | partial-shared | `43.8%` | `1.637 s` | `3981.1` | `253.6` |
+| radix | no-reuse | `0.0%` | `1.750 s` | `6013.4` | `259.1` |
+| radix | shared-prefix | `87.5%` | `1.484 s` | `1621.4` | `256.1` |
+| radix | partial-shared | `43.8%` | `1.614 s` | `4030.2` | `261.1` |
+
+**分析要点**：shared-prefix 命中率按预期达到 `7/8 = 87.5%`，partial-shared 达到 `43.8%`。hash 和 radix 在直接 shared-prefix 测试上命中率一致；hash 是默认高效实现，radix 作为已接入的 block-level metadata backend 保留，主要为后续 branching-prefix workload 服务。
+
+---
+
+### Chunked Prefill（decode_first 调度）
+
+**测试配置**
+
+- Hardware: NVIDIA GeForce RTX 4090 24GB
+- Model: Qwen2.5-3B-Instruct / Qwen2.5-7B-Instruct
+- Workload: 请求 A 短 prompt `32` tokens / 输出 `128` tokens；请求 B 长 prompt `2K..32K` / 输出 `1`，在 A 生成 8 个 token 后插入
+- 关注指标: A 的最大 inter-token latency（越低越好）和 B 的 TTFT
+
+**7B 结果（max inter-token latency on request A）**
+
+| B prompt | no chunk | prefill_first 128 | decode_first 128 | decode_first 1024 (A max / B TTFT) |
+|------:|------:|------:|------:|---:|
+| 2K | `2255.0 ms` | `473.2 ms` | `52.7 ms` | `120.4 / 238.7 ms` |
+| 8K | `778.2 ms` | `1774.7 ms` | `52.0 ms` | `140.3 / 1032.5 ms` |
+| 16K | `1739.6 ms` | `3868.8 ms` | `57.1 ms` | `165.9 / 2268.1 ms` |
+| 32K | `4197.3 ms` | `9221.8 ms` | `57.2 ms` | `219.2 / 5375.0 ms` |
+
+**3B 结果（max inter-token latency on request A）**
+
+| B prompt | no chunk | prefill_first 128 | decode_first 128 | decode_first 1024 (A max / B TTFT) |
+|------:|------:|------:|------:|---:|
+| 2K | `2640.9 ms` | `572.2 ms` | `61.8 ms` | `77.6 / 153.6 ms` |
+| 16K | `888.0 ms` | `4419.1 ms` | `65.4 ms` | `103.3 / 1418.1 ms` |
+| 32K | `2273.4 ms` | `9069.3 ms` | `63.6 ms` | `136.6 / 3344.0 ms` |
+
+**分析要点**：`decode_first` 是降低短请求 decode 卡顿的关键。chunk `128` 在全部 B 长度上把 A 的最大 inter-token latency 压到约 `60 ms`，32K 长 prefill 干扰下 7B 从 `4197 ms` 降到 `57 ms`。`prefill_first` 即使拆 chunk 也会连续服务 B 的 prefill，长 B 下反而把 A 卡顿拉到秒级。chunk 越大 B 的 TTFT 越低、A 的卡顿越高，`512/1024` 适合更偏吞吐的场景，`128` 适合 decode 响应性优先。
+
+---
+
+## 当前边界
+
+- W8A8 端到端 Triton generation 在 SM89 当前路径上仍触发 compiler abort，因此 README 数据使用 HF 质量 gate 和明确的 CUDA/PTX microbench。
+- 7B W8A8 linear backend 中 in-repo CUTLASS 是稳定的全 M 对照路线，旧的 PTX small-M auto threshold 已暂停，等补完被中断的 `scalar_m32` 和 `auto_7b` 检查后再校准。
+- MoE CUDA Graph 在单卡 `ep_size=1` 默认开启；EP all-to-all 因动态 collective 不可 capture 仍强制 eager。
+- Chunked prefill 的 `prefill_first` 不是短 decode 流的延迟优化——32K 插入 prefill + chunk `128` 时，最大 A pause 在 3B/7B 分别约 `9069 / 9222 ms`。
+- K-int8/V-FP8 KV 主质量 gate 已切换为 teacher-forced NLL/PPL；strict token exact alignment 在 16K/32K 多 seed 检查中暴露 K group-size 敏感，BF16 KV 仍是质量 reference。
+- 远端验证环境没有可用 `vllm` 包，README 不展示 vLLM baseline 对比。
+
+## 仓库结构
+
+| Path | 用途 |
+|------|------|
+| `nanovllm/engine/` | scheduler、sequence、model runner、block manager、radix tree |
+| `nanovllm/executor/moe/` | 模块化 MoE runtime（router / prepare-finalize / experts / blocks） |
+| `nanovllm/quantization/` | FP8 runtime、CUDA/PTX JIT、CUTLASS extension、quantization registry |
+| `nanovllm/models/` | Llama / Qwen2 / Qwen2-MoE / Qwen3 / Qwen3-MoE |
+| `scripts/generation/` | generation 与 chunked prefill benchmark |
+| `scripts/kv_cache/` | FP8 / 混合 KV 验证脚本 |
+| `scripts/moe/` | MoE local compute 与 backend benchmark |
+| `scripts/prefix_cache/` | hash / radix prefix cache benchmark |
+| `scripts/quantization/` | FP8 export、质量 gate 与 microbench |
+| `opt/` | 各优化方向的设计与实验记录 |
+| `docs/benchmarks.md` | 提取后的完整 benchmark 结果 |

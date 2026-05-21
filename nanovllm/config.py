@@ -20,11 +20,11 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
-    #: Logical KV storage dtype: ``"bf16"`` (default) or ``"fp8_e4m3"`` (planned; see ``utils/kv_cache``).
+    #: Logical KV storage dtype: ``"bf16"`` (default) or ``"k_int8_v_fp8"`` (experimental mixed KV).
     kv_cache_dtype: str = "bf16"
     experimental_kv_cache_fp8: bool = False
     kv_cache_scale_dtype: str = "float16"
-    moe_backend: str = "fused"
+    moe_backend: str = "optimized"
     moe_ep_backend: str = "torch"
     chunked_prefill_policy: str = "prefill_first"
 
